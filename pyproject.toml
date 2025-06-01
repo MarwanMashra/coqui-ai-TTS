@@ -98,6 +98,10 @@ notebooks = [
 ]
 # For running the TTS server
 server = ["flask>=3.0.0"]
+# For running XTTS with deepspeed engine
+deepspeed = [
+    "deepspeed>=0.16.0",
+]
 # Language-specific dependencies, mainly for G2P
 # Bangla
 bn = [
@@ -129,7 +133,7 @@ languages = [
 ]
 # Installs all extras (except dev and docs)
 all = [
-    "coqui-tts[notebooks,server,bn,ja,ko,zh]",
+    "coqui-tts[notebooks,server,deepspeed,bn,ja,ko,zh]",
 ]
 
 [dependency-groups]
