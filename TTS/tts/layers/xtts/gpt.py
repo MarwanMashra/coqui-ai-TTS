@@ -502,15 +502,16 @@ class GPT(nn.Module):
 
     def generate(
         self,
-        cond_latents,
-        text_inputs,
+        cond_latents: torch.Tensor,
+        text_inputs: torch.Tensor,
         **hf_generate_kwargs,
     ):
         gpt_inputs = self.compute_embeddings(cond_latents, text_inputs)
         stop_token_tensor = torch.tensor(self.stop_audio_token, device=gpt_inputs.device, dtype=torch.long)
         attention_mask = _prepare_attention_mask_for_generation(gpt_inputs, stop_token_tensor, stop_token_tensor)
         gen = self.gpt_inference.generate(
-            gpt_inputs,
+            (cond_latents.size(1), cond_latents.size(1) + text_inputs.size(1) + 2),
+            inputs=gpt_inputs,
             bos_token_id=self.start_audio_token,
             pad_token_id=self.stop_audio_token,
             eos_token_id=self.stop_audio_token,

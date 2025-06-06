@@ -3,11 +3,14 @@ from torch import nn
 from transformers import GenerationMixin, GPT2PreTrainedModel
 from transformers.modeling_outputs import CausalLMOutputWithCrossAttentions
 
+from TTS.tts.layers.xtts.alignment_analyzer import AlignmentAnalyzer
 from TTS.tts.layers.xtts.stream_generator import StreamGenerationConfig
 
 
 class GPT2InferenceModel(GPT2PreTrainedModel, GenerationMixin):
     """Override GPT2LMHeadModel to allow for prefix conditioning."""
+
+    alignment_analyzer: AlignmentAnalyzer
 
     def __init__(self, config, gpt, pos_emb, embeddings, norm, linear, kv_cache):
         super().__init__(config)
@@ -53,6 +56,29 @@ class GPT2InferenceModel(GPT2PreTrainedModel, GenerationMixin):
             "token_type_ids": token_type_ids,
         }
 
+    def hook_alignment_analyzer(self, text_inputs_slice: tuple[int, int], eos_token_id: int):
+        """
+        Hook the alignment analyzer to the model. This is used to analyze the alignment of text and speech during
+        generation.
+        :param text_inputs_slice: A tuple (start, end) indicating the slice of text inputs to analyze.
+        :param eos_token_id: The end-of-sequence token ID.
+        """
+        self.alignment_analyzer = AlignmentAnalyzer(
+            self.transformer,
+            None,  # No queue for now
+            text_inputs_slice,
+            alignment_layer_idx=9,  # hparam
+            eos_idx=eos_token_id,
+        )
+
+    def unhook_alignment_analyzer(self): ...
+
+    def generate(self, text_inputs_slice: tuple[int, int], eos_token_id: int, **generate_kwargs):
+        self.hook_alignment_analyzer(text_inputs_slice, eos_token_id)
+        output = super().generate(**generate_kwargs)
+        self.unhook_alignment_analyzer()
+        return output
+
     def forward(
         self,
         input_ids=None,
@@ -80,6 +106,7 @@ class GPT2InferenceModel(GPT2PreTrainedModel, GenerationMixin):
         # Create embedding
         prefix_len = self.cached_prefix_emb.shape[1]
         if input_ids.shape[1] != 1:
+            # prefill step
             gen_inputs = input_ids[:, prefix_len:]
             gen_emb = self.embeddings(gen_inputs)
             gen_emb = gen_emb + self.pos_embedding(gen_emb)
@@ -91,6 +118,7 @@ class GPT2InferenceModel(GPT2PreTrainedModel, GenerationMixin):
                 prefix_emb = self.cached_prefix_emb.to(gen_emb.dtype)
             emb = torch.cat([prefix_emb, gen_emb], dim=1)
         else:
+            # decoding step
             emb = self.embeddings(input_ids)
             emb = emb + self.pos_embedding.get_fixed_embedding(
                 attention_mask.shape[1] - (prefix_len + 1), attention_mask.device
@@ -111,6 +139,8 @@ class GPT2InferenceModel(GPT2PreTrainedModel, GenerationMixin):
         )
         hidden_states = transformer_outputs[0]
         lm_logits = self.lm_head(hidden_states)
+
+        # NOTE: alignment step should be called here
 
         if not return_dict:
             return (lm_logits,) + transformer_outputs[1:]
