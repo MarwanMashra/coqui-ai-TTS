@@ -1,6 +1,6 @@
 import torch
 from torch import nn
-from transformers import GenerationMixin, GPT2PreTrainedModel
+from transformers import GenerationMixin, GPT2Model, GPT2PreTrainedModel
 from transformers.modeling_outputs import CausalLMOutputWithCrossAttentions
 
 from TTS.tts.layers.xtts.alignment_analyzer import AlignmentAnalyzer
@@ -11,8 +11,9 @@ class GPT2InferenceModel(GPT2PreTrainedModel, GenerationMixin):
     """Override GPT2LMHeadModel to allow for prefix conditioning."""
 
     alignment_analyzer: AlignmentAnalyzer
+    alignment_layer_idx: int = 16  # hparam, the layer to analyze
 
-    def __init__(self, config, gpt, pos_emb, embeddings, norm, linear, kv_cache):
+    def __init__(self, config, gpt: GPT2Model, pos_emb, embeddings, norm, linear, kv_cache):
         super().__init__(config)
         self.transformer = gpt
         self.pos_embedding = pos_emb
@@ -63,18 +64,18 @@ class GPT2InferenceModel(GPT2PreTrainedModel, GenerationMixin):
         :param text_inputs_slice: A tuple (start, end) indicating the slice of text inputs to analyze.
         :param eos_token_id: The end-of-sequence token ID.
         """
+
         self.alignment_analyzer = AlignmentAnalyzer(
-            self.transformer,
-            None,  # No queue for now
-            text_inputs_slice,
-            alignment_layer_idx=9,  # hparam
+            alignment_layer=self.transformer.h[self.alignment_layer_idx].attn,  # hparam
+            forward_output_to_attn_weights=lambda output: output[2],
+            text_tokens_slice=text_inputs_slice,
             eos_idx=eos_token_id,
         )
 
     def unhook_alignment_analyzer(self): ...
 
     def generate(self, text_inputs_slice: tuple[int, int], eos_token_id: int, **generate_kwargs):
-        self.hook_alignment_analyzer(text_inputs_slice, eos_token_id)
+        # self.hook_alignment_analyzer(text_inputs_slice, eos_token_id)
         output = super().generate(**generate_kwargs)
         self.unhook_alignment_analyzer()
         return output
@@ -139,6 +140,7 @@ class GPT2InferenceModel(GPT2PreTrainedModel, GenerationMixin):
         )
         hidden_states = transformer_outputs[0]
         lm_logits = self.lm_head(hidden_states)
+        # lm_logits = self.alignment_analyzer.step(lm_logits)
 
         # NOTE: alignment step should be called here
 

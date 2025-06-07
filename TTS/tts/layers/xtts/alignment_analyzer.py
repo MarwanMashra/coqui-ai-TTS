@@ -1,10 +1,17 @@
+from collections.abc import Callable
 from types import MethodType
 
 import torch
 
 
 class AlignmentAnalyzer:
-    def __init__(self, tfmr, queue, text_tokens_slice, alignment_layer_idx=9, eos_idx=0):
+    def __init__(
+        self,
+        alignment_layer: torch.nn.Module,
+        text_tokens_slice: tuple[int, int],
+        forward_output_to_attn_weights: Callable[[tuple], torch.Tensor],
+        eos_idx: int,
+    ):
         """
         Some transformer TTS models implicitly solve text-speech alignment in one or more of their self-attention
         activation maps. This module exploits this to perform online integrity checks which streaming.
@@ -31,9 +38,10 @@ class AlignmentAnalyzer:
         # using it for all layers slows things down too much. We can apply it to just one layer
         # by intercepting the kwargs and adding a forward hook (credit: jrm)
         self.last_aligned_attn = None
-        self._add_attention_spy(tfmr, alignment_layer_idx)
+        self._add_attention_spy(alignment_layer)
+        self.forward_output_to_attn_weights = forward_output_to_attn_weights
 
-    def _add_attention_spy(self, tfmr, alignment_layer_idx):
+    def _add_attention_spy(self, alignment_layer: torch.nn.Module):
         """
         Adds a forward hook to a specific attention layer to collect outputs.
         Using `output_attentions=True` is incompatible with optimized attention kernels, so
@@ -48,22 +56,22 @@ class AlignmentAnalyzer:
             - When `output_attentions=True`, `LlamaSdpaAttention.forward` calls `LlamaAttention.forward`.
             - `attn_output` has shape [B, H, T0, T0] for the 0th entry, and [B, H, 1, T0+i] for the rest i-th.
             """
-            # step_attention = output[1].cpu()  # (B, 16, N, N)
-            # self.last_aligned_attn = step_attention[0].mean(0)  # (N, N)
-            print(f"AlignmentAnalyzer: output {output}")
+            step_attention = self.forward_output_to_attn_weights(output).cpu()  # (B, 16, N, N)
+            self.last_aligned_attn = step_attention[0].mean(0)  # (N, N)
+            # print(f"AlignmentAnalyzer: output {type(output)} {len(output)} {output[0].shape=}, {len(output[1])}")
+            # print(f"AlignmentAnalyzer: last_aligned_attn shape={self.last_aligned_attn.shape}")
 
-        target_layer = tfmr.h[alignment_layer_idx].attn
-        hook_handle = target_layer.register_forward_hook(attention_forward_hook)
+        hook_handle = alignment_layer.register_forward_hook(attention_forward_hook)
 
         # Backup original forward
-        original_forward = target_layer.forward
+        original_forward = alignment_layer.forward
 
         def patched_forward(self, *args, **kwargs):
             kwargs["output_attentions"] = True
             return original_forward(*args, **kwargs)
 
         # TODO: how to unpatch it?
-        target_layer.forward = MethodType(patched_forward, target_layer)
+        alignment_layer.forward = MethodType(patched_forward, alignment_layer)
 
     def step(self, logits):
         """
@@ -106,6 +114,13 @@ class AlignmentAnalyzer:
         if self.complete and self.completed_at is None:
             self.completed_at = T
 
+        print(
+            f"AlignmentAnalyzer: {self.curr_frame_pos=}, cur_text_posn={cur_text_posn}, {self.text_position=}, text_len={S}"
+        )
+        self.curr_frame_pos += 1
+
+        return logits
+
         # NOTE: EOS rarely assigned activations, and second-last token is often punctuation, so use last 3 tokens.
         # NOTE: due to the false-start behaviour, we need to make sure we skip activations for the first few tokens.
         # Q:
@@ -126,7 +141,7 @@ class AlignmentAnalyzer:
         # NOTE: this means logits may be inconsistent with latents!
         if long_tail or repetition:
             print(f"forcing EOS token, {long_tail=}, {repetition=}")
-            # (±2**15 is safe for all dtypes >= 16bit)
+            # (Â±2**15 is safe for all dtypes >= 16bit)
             logits = -(2**15) * torch.ones_like(logits)
             logits[..., self.eos_idx] = 2**15
 
@@ -140,5 +155,4 @@ class AlignmentAnalyzer:
             #   - cur_text_posn might be risky to use, why not use self.text_position?
             logits[..., self.eos_idx] = -(2**15)
 
-        self.curr_frame_pos += 1
         return logits
