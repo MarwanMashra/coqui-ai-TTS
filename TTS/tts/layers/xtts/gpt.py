@@ -440,6 +440,8 @@ class GPT(nn.Module):
             attn_mask_text=attn_mask_text,
             attn_mask_mel=attn_mask_mel,
         )
+
+        # self.gpt_inference.alignment_analyzer.step(mel_logits)
         if return_latent:
             return mel_logits[:, :sub]  # sub to prevent bla.
 

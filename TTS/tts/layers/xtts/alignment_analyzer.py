@@ -2,6 +2,7 @@ from collections.abc import Callable
 from types import MethodType
 
 import torch
+from torch.utils.hooks import RemovableHandle
 
 
 class AlignmentAnalyzer:
@@ -38,10 +39,33 @@ class AlignmentAnalyzer:
         # using it for all layers slows things down too much. We can apply it to just one layer
         # by intercepting the kwargs and adding a forward hook (credit: jrm)
         self.last_aligned_attn = None
-        self._add_attention_spy(alignment_layer)
+        self.alignment_layer = alignment_layer
+        self._add_attention_spy()
         self.forward_output_to_attn_weights = forward_output_to_attn_weights
+        self.hit_end_couter = 0
+        self.did_hit_end = False
+        self.hook_handle: RemovableHandle | None = None
+        self.original_forward: Callable | None = None
 
-    def _add_attention_spy(self, alignment_layer: torch.nn.Module):
+    def unhook(self):
+        """
+        Unhooks the attention layer to stop collecting outputs and restore the original forward method.
+        """
+        print("Unhooking AlignmentAnalyzer...")
+        # NOTE: this doesn't work, both are None
+        if self.hook_handle is not None:
+            print("Removing hook from alignment layer")
+            self.hook_handle.remove()
+            self.hook_handle = None
+
+        # Restore original forward method
+        if self.original_forward is not None:
+            print("Restoring original forward method of alignment layer")
+            self.alignment_layer.forward = MethodType(self.original_forward, self.alignment_layer)
+            self.original_forward = None
+            print("self.alignment_layer.forward:", self.alignment_layer.forward)
+
+    def _add_attention_spy(self):
         """
         Adds a forward hook to a specific attention layer to collect outputs.
         Using `output_attentions=True` is incompatible with optimized attention kernels, so
@@ -58,20 +82,19 @@ class AlignmentAnalyzer:
             """
             step_attention = self.forward_output_to_attn_weights(output).cpu()  # (B, 16, N, N)
             self.last_aligned_attn = step_attention[0].mean(0)  # (N, N)
-            # print(f"AlignmentAnalyzer: output {type(output)} {len(output)} {output[0].shape=}, {len(output[1])}")
-            # print(f"AlignmentAnalyzer: last_aligned_attn shape={self.last_aligned_attn.shape}")
 
-        hook_handle = alignment_layer.register_forward_hook(attention_forward_hook)
+        self.hook_handle = self.alignment_layer.register_forward_hook(attention_forward_hook)
 
         # Backup original forward
-        original_forward = alignment_layer.forward
+        original_forward = self.alignment_layer.forward
 
-        def patched_forward(self, *args, **kwargs):
+        def patched_forward(_, *args, **kwargs):
             kwargs["output_attentions"] = True
             return original_forward(*args, **kwargs)
 
         # TODO: how to unpatch it?
-        alignment_layer.forward = MethodType(patched_forward, alignment_layer)
+        self.alignment_layer.forward = MethodType(patched_forward, self.alignment_layer)
+        self.original_forward = original_forward
 
     def step(self, logits):
         """
@@ -86,37 +109,34 @@ class AlignmentAnalyzer:
         else:
             # subsequent chunks have 1 frame due to KV-caching
             A_chunk = aligned_attn[:, i:j].clone().cpu()  # (1, S)
-
-        # TODO: monotonic masking; could have issue b/c spaces are often skipped.
-        A_chunk[:, self.curr_frame_pos + 1 :] = 0  # Q: what on earth ???
+        A_chunk[:, 0] = 0
 
         self.alignment = torch.cat((self.alignment, A_chunk), dim=0)
 
         A = self.alignment
-        T, S = A.shape  # Q: so T is speech tokens, S is text tokens? weird naming...
+        S, T = A.shape  # Q: so T is speech tokens, S is text tokens? weird naming...
 
         # update position
+        # print(A_chunk[-1])
         cur_text_posn = A_chunk[-1].argmax()
         continuity = -4 < cur_text_posn - self.text_position < 7  # NOTE: very lenient!
         if continuity:
             self.text_position = cur_text_posn
 
-        # Hallucinations at the start of speech show up as activations at the bottom of the attention maps!
-        # To mitigate this, we just wait until there are no activations far off-diagonal in the last 2 tokens,
-        # and there are some strong activations in the first few tokens.
-        false_start = (not self.started) and (A[-2:, -2:].max() > 0.1 or A[:, :4].max() < 0.5)
-        self.started = not false_start
-        if self.started and self.started_at is None:
-            self.started_at = T
-
-        # Is generation likely complete?
-        self.complete = self.complete or self.text_position >= S - 3
-        if self.complete and self.completed_at is None:
-            self.completed_at = T
+        if self.text_position == T - 1:
+            self.hit_end_couter += 1
+            if self.hit_end_couter > 3:
+                self.did_hit_end = True
 
         print(
-            f"AlignmentAnalyzer: {self.curr_frame_pos=}, cur_text_posn={cur_text_posn}, {self.text_position=}, text_len={S}"
+            f"AlignmentAnalyzer: {self.curr_frame_pos=}, cur_text_posn={cur_text_posn}, {self.text_position=}, text_len={T}"
         )
+
+        if self.did_hit_end and cur_text_posn < T - 1:
+            logits = -(2**15) * torch.ones_like(logits)
+            logits[..., self.eos_idx] = 2**15
+            print("AlignmentAnalyzer: forcing EOS due to did_hit_end")
+
         self.curr_frame_pos += 1
 
         return logits
@@ -147,9 +167,9 @@ class AlignmentAnalyzer:
 
         # Suppress EoS to prevent early termination
         print(
-            f"Suppressing EOS (cur_text_posn={cur_text_posn.item()}, self.text_position={self.text_position.item()}),  {S=}, {T=}, {self.curr_frame_pos=}, {self.text_tokens_slice=}, {self.complete=}, {self.completed_at=}"
+            f"Suppressing EOS (cur_text_posn={cur_text_posn.item()}, self.text_position={self.text_position.item()}),  {T=}, {S=}, {self.curr_frame_pos=}, {self.text_tokens_slice=}, {self.complete=}, {self.completed_at=}"
         )
-        if self.text_position < S - 3:  # FIXME: arbitrary
+        if self.text_position < T - 3:  # FIXME: arbitrary
             # Q:
             #   - what if long_tail or repetition? then everything is set to -2**15
             #   - cur_text_posn might be risky to use, why not use self.text_position?

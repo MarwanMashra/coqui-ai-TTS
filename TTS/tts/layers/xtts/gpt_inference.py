@@ -10,8 +10,7 @@ from TTS.tts.layers.xtts.stream_generator import StreamGenerationConfig
 class GPT2InferenceModel(GPT2PreTrainedModel, GenerationMixin):
     """Override GPT2LMHeadModel to allow for prefix conditioning."""
 
-    alignment_analyzer: AlignmentAnalyzer
-    alignment_layer_idx: int = 16  # hparam, the layer to analyze
+    alignment_layer_idx: int = 12  # hparam, the layer that has the alignment information
 
     def __init__(self, config, gpt: GPT2Model, pos_emb, embeddings, norm, linear, kv_cache):
         super().__init__(config)
@@ -22,6 +21,7 @@ class GPT2InferenceModel(GPT2PreTrainedModel, GenerationMixin):
         self.lm_head = nn.Sequential(norm, linear)
         self.kv_cache = kv_cache
         self.generation_config = StreamGenerationConfig.from_model_config(config) if self.can_generate() else None
+        self.alignment_analyzer: AlignmentAnalyzer | None = None
 
     def store_prefix_emb(self, prefix_emb):
         self.cached_prefix_emb = prefix_emb
@@ -57,27 +57,15 @@ class GPT2InferenceModel(GPT2PreTrainedModel, GenerationMixin):
             "token_type_ids": token_type_ids,
         }
 
-    def hook_alignment_analyzer(self, text_inputs_slice: tuple[int, int], eos_token_id: int):
-        """
-        Hook the alignment analyzer to the model. This is used to analyze the alignment of text and speech during
-        generation.
-        :param text_inputs_slice: A tuple (start, end) indicating the slice of text inputs to analyze.
-        :param eos_token_id: The end-of-sequence token ID.
-        """
-
+    def generate(self, text_inputs_slice: tuple[int, int], eos_token_id: int, **generate_kwargs):
         self.alignment_analyzer = AlignmentAnalyzer(
-            alignment_layer=self.transformer.h[self.alignment_layer_idx].attn,  # hparam
+            alignment_layer=self.transformer.h[self.alignment_layer_idx].attn,
             forward_output_to_attn_weights=lambda output: output[2],
             text_tokens_slice=text_inputs_slice,
             eos_idx=eos_token_id,
         )
-
-    def unhook_alignment_analyzer(self): ...
-
-    def generate(self, text_inputs_slice: tuple[int, int], eos_token_id: int, **generate_kwargs):
-        # self.hook_alignment_analyzer(text_inputs_slice, eos_token_id)
-        output = super().generate(**generate_kwargs)
-        self.unhook_alignment_analyzer()
+        output = super().generate(eos_token_id=eos_token_id, **generate_kwargs)
+        self.alignment_analyzer.unhook()
         return output
 
     def forward(
@@ -140,7 +128,7 @@ class GPT2InferenceModel(GPT2PreTrainedModel, GenerationMixin):
         )
         hidden_states = transformer_outputs[0]
         lm_logits = self.lm_head(hidden_states)
-        # lm_logits = self.alignment_analyzer.step(lm_logits)
+        lm_logits = self.alignment_analyzer.step(lm_logits)
 
         # NOTE: alignment step should be called here
 
