@@ -239,7 +239,6 @@ def build_hf_gpt_transformer(
         n_head=heads,
         gradient_checkpointing=checkpointing,
         use_cache=not checkpointing,
-        torch_dtype=torch.float16
     )
     gpt = GPT2Model(gpt_config)
     # Override the built in positional embeddings
