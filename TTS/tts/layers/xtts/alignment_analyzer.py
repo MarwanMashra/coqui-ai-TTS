@@ -74,6 +74,7 @@ class AlignmentAnalyzer:
         text_tokens_slice: tuple[int, int],
         forward_output_to_attn_weights: Callable[[tuple], torch.Tensor],
         eos_idx: int,
+        set_output_attentions: bool = True,
     ):
         """
         Some transformer TTS models implicitly solve text-speech alignment in one or more of their self-attention
@@ -109,7 +110,7 @@ class AlignmentAnalyzer:
         self.hook_handle: RemovableHandle | None = None
         self.original_forward: Callable | None = None
         self.pre_deepspeed_alignment_layer: GPT2Attention = layer
-        self.layer_past = None
+        self.set_output_attentions = set_output_attentions
 
     def unhook(self):
         """
@@ -138,49 +139,16 @@ class AlignmentAnalyzer:
         """
 
         def attention_forward_hook(module, inputs, output):
-            # print(len(inputs))
-
-            i, j = self.text_tokens_slice
-            # print("##############")
-
-            # print("Gold truth")
-            # step_attention = output[2][0].mean(0)
-            # print("step_attention:", step_attention.shape)
-            # print(step_attention[-1, i:j])
-            # self.last_aligned_attn = step_attention.cpu()  # (N, N)
-            # print("---------------")
-
-            # print("Compute myself")
-            # step_attention = _attention_forward_hook(module, inputs, output)[0].mean(0)
-            # print("step_attention:", step_attention.shape)
-            # print(step_attention[-1, i:j])
-            # print("---------------")
-
-            # input, input_mask, head_mask, layer_past, *_ = inputs
-            # if len(inputs) > 1:
-            #     print(f"Got {len(inputs)} inputs, using first one")
-            # print(f"{inputs[0].shape=}")
-            # print(f"{output[-1].shape=}")
-            t0 = time.time()
+            _, input_mask, head_mask, layer_past, *_ = inputs
             output = self.pre_deepspeed_alignment_layer.forward(
                 hidden_states=output[-1],
-                # hidden_states=input,
-                layer_past=self.layer_past,
-                # attention_mask=input_mask,
-                # head_mask=head_mask,
+                layer_past=layer_past,
+                attention_mask=input_mask,
+                head_mask=head_mask,
                 output_attentions=True,
-                use_cache=True,
             )
-            global TOTAL_TIME
-            self.layer_past = output[1]  # update layer_past for next step
-            # print("Use pre-deepspeed alignment layer")
-            step_attention = self.forward_output_to_attn_weights(output)[0].mean(0)  # (B, 16, N, N)
+            step_attention = output[2][0].mean(0)  # (B, 16, N, N)
             self.last_aligned_attn = step_attention.cpu()  # (N, N)
-            # print("step_attention:", step_attention.shape)
-            TOTAL_TIME += time.time() - t0
-            print(f"AlignmentAnalyzer: attention forward took {TOTAL_TIME:.3f} seconds")
-            # print(step_attention[-1])
-            # print("##############")
 
         self.hook_handle = self.alignment_layer.register_forward_hook(attention_forward_hook)
 
@@ -188,7 +156,8 @@ class AlignmentAnalyzer:
         original_forward = self.alignment_layer.forward
 
         def patched_forward(_, *args, **kwargs):
-            # kwargs["output_attentions"] = True
+            if self.set_output_attentions:
+                kwargs["output_attentions"] = True
             return original_forward(*args, **kwargs)
 
         # TODO: how to unpatch it?

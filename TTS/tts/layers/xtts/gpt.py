@@ -155,8 +155,6 @@ class GPT(nn.Module):
         if use_deepspeed:
             import deepspeed
 
-            # NOTE: move this somewhere else
-            alignment_layer = self.gpt_inference.transformer.h[12].attn
             self.ds_engine = deepspeed.init_inference(
                 model=self.gpt_inference.half(),  # Transformers models
                 mp_size=1,  # Number of GPU
@@ -165,9 +163,6 @@ class GPT(nn.Module):
                 replace_with_kernel_inject=True,  # replace the model with the kernel injector
             )
             self.gpt_inference = self.ds_engine.module.eval()
-            self.gpt_inference.alignment_layer = alignment_layer
-        else:
-            self.gpt_inference.alignment_layer = self.gpt_inference.transformer.h[12].attn
 
     def set_inputs_and_targets(self, input, start_token, stop_token):
         inp = F.pad(input, (1, 0), value=start_token)
