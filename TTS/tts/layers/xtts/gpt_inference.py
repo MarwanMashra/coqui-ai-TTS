@@ -22,6 +22,7 @@ class GPT2InferenceModel(GPT2PreTrainedModel, GenerationMixin):
         self.kv_cache = kv_cache
         self.generation_config = StreamGenerationConfig.from_model_config(config) if self.can_generate() else None
         self.alignment_analyzer: AlignmentAnalyzer | None = None
+        self.alignment_layer: torch.nn.Module = None
 
     def store_prefix_emb(self, prefix_emb):
         self.cached_prefix_emb = prefix_emb
@@ -60,6 +61,8 @@ class GPT2InferenceModel(GPT2PreTrainedModel, GenerationMixin):
     def generate(self, text_inputs_slice: tuple[int, int], eos_token_id: int, **generate_kwargs):
         self.alignment_analyzer = AlignmentAnalyzer(
             alignment_layer=self.transformer.h[self.alignment_layer_idx].attention,
+            # alignment_layer=self.transformer.h[self.alignment_layer_idx].attn,
+            layer=self.alignment_layer,
             forward_output_to_attn_weights=lambda output: output[2],
             text_tokens_slice=text_inputs_slice,
             eos_idx=eos_token_id,

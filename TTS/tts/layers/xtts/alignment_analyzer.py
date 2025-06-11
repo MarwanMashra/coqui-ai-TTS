@@ -4,10 +4,13 @@ from types import MethodType
 
 import torch
 from torch.utils.hooks import RemovableHandle
+from transformers.models.gpt2.modeling_gpt2 import GPT2Attention
 
-minus_inf = -10_000.0          # same constant used by DeepSpeed
+minus_inf = -10_000.0  # same constant used by DeepSpeed
 
 TOTAL_TIME = 0.0
+
+
 def _attention_forward_hook(module, inputs, output):
     """
     Return attention‐probs for the *current* query token(s) against *all* keys.
@@ -18,35 +21,37 @@ def _attention_forward_hook(module, inputs, output):
     """
     global TOTAL_TIME
     t0 = time.time()
-    hidden_states, attn_mask, *rest = inputs        # (B, T_q, hidden)
-    key_layer  = output[1]                          # cached keys
-    B, T_q, _  = hidden_states.shape
-    H          = module.num_attention_heads_per_partition
-    D          = module.hidden_size_per_attention_head
-    norm       = module.norm_factor if module.config.scale_attention else 1.0
+    # print(len(inputs))
+    # print(inputs[0].shape)
+    hidden_states, attn_mask, *rest = inputs  # (B, T_q, hidden)
+    key_layer = output[1]  # cached keys
+    B, T_q, _ = hidden_states.shape
+    H = module.num_attention_heads_per_partition
+    D = module.hidden_size_per_attention_head
+    norm = module.norm_factor if module.config.scale_attention else 1.0
 
     # ---- 1. make QUERY in the same flattened (B*H) layout -------------------
-    W_qkv, b_qkv = module._attn_qkvw, module._attn_qkvb          # prepared by fwd
-    qkv   = hidden_states @ W_qkv + b_qkv                        # (B,T_q,3*hidden)
-    qkv   = qkv.view(B, T_q, H, 3*D)
-    query, _, _ = torch.chunk(qkv, 3, dim=-1)                    # (B,T_q,H,D)
-    query = query.transpose(1, 2)                                # (B,H,T_q,D)
-    query = query.reshape(B * H, T_q, D) / norm                  # (*,T_q,D)
+    W_qkv, b_qkv = module._attn_qkvw, module._attn_qkvb  # prepared by fwd
+    qkv = hidden_states @ W_qkv + b_qkv  # (B,T_q,3*hidden)
+    qkv = qkv.view(B, T_q, H, 3 * D)
+    query, _, _ = torch.chunk(qkv, 3, dim=-1)  # (B,T_q,H,D)
+    query = query.transpose(1, 2)  # (B,H,T_q,D)
+    query = query.reshape(B * H, T_q, D) / norm  # (*,T_q,D)
 
     # ---- 2. KEY layout can vary a bit; standardise to (*,D,K) --------------
-    if key_layer.dim() == 4:                                     # (B,H,D,K)
+    if key_layer.dim() == 4:  # (B,H,D,K)
         key_flat = key_layer.view(B * H, D, -1)
-    else:                                                        # (B*H, ?, ?)
+    else:  # (B*H, ?, ?)
         # Detect where head_dim lives
         if key_layer.shape[1] == D:
-            key_flat = key_layer                                 # (*,D,K)
-        else:                                                    # (*,K,D)  → swap
-            key_flat = key_layer.transpose(1, 2)                 # (*,D,K)
+            key_flat = key_layer  # (*,D,K)
+        else:  # (*,K,D)  → swap
+            key_flat = key_layer.transpose(1, 2)  # (*,D,K)
 
     K_tot = key_flat.shape[-1]
 
     # ---- 3. Dot-product -----------------------------------------------------
-    scores = torch.bmm(query, key_flat)                          # (*,T_q,K)
+    scores = torch.bmm(query, key_flat)  # (*,T_q,K)
     scores = scores.view(B, H, T_q, K_tot)
 
     # ---- 4. Apply mask in exactly the same spirit as DS --------------------
@@ -58,19 +63,14 @@ def _attention_forward_hook(module, inputs, output):
             attn_mask = attn_mask.unsqueeze(1)
         scores += (1 - attn_mask).to(scores.dtype) * minus_inf
 
-    attn_probs = torch.softmax(scores, dim=-1)                   # (B,H,T_q,K_tot)
+    return torch.softmax(scores, dim=-1)  # (B,H,T_q,K_tot)
 
-    return attn_probs[0].mean(0)
-
-    # TOTAL_TIME += time.time() - t0
-
-    # print("attn_probs:", attn_probs.shape)
-    # print(f"TOTAL_TIME: {TOTAL_TIME:.5f} sec")
 
 class AlignmentAnalyzer:
     def __init__(
         self,
         alignment_layer: torch.nn.Module,
+        layer: torch.nn.Module,
         text_tokens_slice: tuple[int, int],
         forward_output_to_attn_weights: Callable[[tuple], torch.Tensor],
         eos_idx: int,
@@ -108,6 +108,8 @@ class AlignmentAnalyzer:
         self.did_hit_end = False
         self.hook_handle: RemovableHandle | None = None
         self.original_forward: Callable | None = None
+        self.pre_deepspeed_alignment_layer: GPT2Attention = layer
+        self.layer_past = None
 
     def unhook(self):
         """
@@ -135,28 +137,50 @@ class AlignmentAnalyzer:
         (credit: jrm)
         """
 
-        # def attention_forward_hook(module, input, output):
+        def attention_forward_hook(module, inputs, output):
+            # print(len(inputs))
 
-        #     """
-        #     See `LlamaAttention.forward`; the output is a 3-tuple: `attn_output, attn_weights, past_key_value`.
-        #     NOTE:
-        #     - When `output_attentions=True`, `LlamaSdpaAttention.forward` calls `LlamaAttention.forward`.
-        #     - `attn_output` has shape [B, H, T0, T0] for the 0th entry, and [B, H, 1, T0+i] for the rest i-th.
+            i, j = self.text_tokens_slice
+            # print("##############")
 
-        #     DeepSpeedSelfAttention|TritonSelfAttention: forward() -> [output, key_layer, value_layer, context_layer, inp_norm]
-        #     """
-        #     print(module)
-        #     print(len(output))
-        #     print(output[0].shape)
-        #     print(output[1].shape)
-        #     print(output[2].shape)
-        #     print(output[3].shape)
-        #     print(output[4].shape)
-        #     step_attention = self.forward_output_to_attn_weights(output).cpu()  # (B, 16, N, N)
-        #     self.last_aligned_attn = step_attention[0].mean(0)  # (N, N)
+            # print("Gold truth")
+            # step_attention = output[2][0].mean(0)
+            # print("step_attention:", step_attention.shape)
+            # print(step_attention[-1, i:j])
+            # self.last_aligned_attn = step_attention.cpu()  # (N, N)
+            # print("---------------")
 
-        def attention_forward_hook(module, input, output):
-            self.last_aligned_attn = _attention_forward_hook(module, input, output).cpu()
+            # print("Compute myself")
+            # step_attention = _attention_forward_hook(module, inputs, output)[0].mean(0)
+            # print("step_attention:", step_attention.shape)
+            # print(step_attention[-1, i:j])
+            # print("---------------")
+
+            # input, input_mask, head_mask, layer_past, *_ = inputs
+            # if len(inputs) > 1:
+            #     print(f"Got {len(inputs)} inputs, using first one")
+            # print(f"{inputs[0].shape=}")
+            # print(f"{output[-1].shape=}")
+            t0 = time.time()
+            output = self.pre_deepspeed_alignment_layer.forward(
+                hidden_states=output[-1],
+                # hidden_states=input,
+                layer_past=self.layer_past,
+                # attention_mask=input_mask,
+                # head_mask=head_mask,
+                output_attentions=True,
+                use_cache=True,
+            )
+            global TOTAL_TIME
+            self.layer_past = output[1]  # update layer_past for next step
+            # print("Use pre-deepspeed alignment layer")
+            step_attention = self.forward_output_to_attn_weights(output)[0].mean(0)  # (B, 16, N, N)
+            self.last_aligned_attn = step_attention.cpu()  # (N, N)
+            # print("step_attention:", step_attention.shape)
+            TOTAL_TIME += time.time() - t0
+            print(f"AlignmentAnalyzer: attention forward took {TOTAL_TIME:.3f} seconds")
+            # print(step_attention[-1])
+            # print("##############")
 
         self.hook_handle = self.alignment_layer.register_forward_hook(attention_forward_hook)
 
