@@ -58,8 +58,9 @@ class GPT2InferenceModel(GPT2PreTrainedModel, GenerationMixin):
         }
 
     def generate(self, text_inputs_slice: tuple[int, int], eos_token_id: int, **generate_kwargs):
+        print("####", self.transformer.h[self.alignment_layer_idx].attention)
         self.alignment_analyzer = AlignmentAnalyzer(
-            alignment_layer=self.transformer.h[self.alignment_layer_idx].attn,
+            alignment_layer=self.transformer.h[self.alignment_layer_idx].attention,
             forward_output_to_attn_weights=lambda output: output[2],
             text_tokens_slice=text_inputs_slice,
             eos_idx=eos_token_id,

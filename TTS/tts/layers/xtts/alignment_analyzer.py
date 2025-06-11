@@ -79,7 +79,15 @@ class AlignmentAnalyzer:
             NOTE:
             - When `output_attentions=True`, `LlamaSdpaAttention.forward` calls `LlamaAttention.forward`.
             - `attn_output` has shape [B, H, T0, T0] for the 0th entry, and [B, H, 1, T0+i] for the rest i-th.
+
+            DeepSpeedSelfAttention: forward() -> [output, key_layer, value_layer, context_layer, inp_norm]
             """
+            print(len(output))
+            print(output[0].shape)
+            print(output[1].shape)
+            print(output[2].shape)
+            print(output[3].shape)
+            print(output[4].shape)
             step_attention = self.forward_output_to_attn_weights(output).cpu()  # (B, 16, N, N)
             self.last_aligned_attn = step_attention[0].mean(0)  # (N, N)
 
@@ -89,7 +97,7 @@ class AlignmentAnalyzer:
         original_forward = self.alignment_layer.forward
 
         def patched_forward(_, *args, **kwargs):
-            kwargs["output_attentions"] = True
+            # kwargs["output_attentions"] = True
             return original_forward(*args, **kwargs)
 
         # TODO: how to unpatch it?
@@ -138,41 +146,5 @@ class AlignmentAnalyzer:
             print("AlignmentAnalyzer: forcing EOS due to did_hit_end")
 
         self.curr_frame_pos += 1
-
-        return logits
-
-        # NOTE: EOS rarely assigned activations, and second-last token is often punctuation, so use last 3 tokens.
-        # NOTE: due to the false-start behaviour, we need to make sure we skip activations for the first few tokens.
-        # Q:
-        #   - didn't we already decided that the generation is complete?
-        #   - why not A[self.completed_at:, -3:]?
-        #   - also why not A[15:, -3] and just ignore punc and EOS?
-        #   - why do the sum ? it's influenced by the number of frames
-        last_text_token_duration = A[15:, -3:].sum()
-
-        # Activations for the final token that last too long are likely hallucinations.
-        # Q: how is the sum of activations gives you an estimate of the duration?
-        long_tail = self.complete and (A[self.completed_at :, -3:].sum(dim=0).max() >= 10)  # 400ms
-
-        # If there are activations in previous tokens after generation has completed, assume this is a repetition error.
-        repetition = self.complete and (A[self.completed_at :, :-5].max(dim=1).values.sum() > 5)
-
-        # If a bad ending is detected, force emit EOS by modifying logits
-        # NOTE: this means logits may be inconsistent with latents!
-        if long_tail or repetition:
-            print(f"forcing EOS token, {long_tail=}, {repetition=}")
-            # (Â±2**15 is safe for all dtypes >= 16bit)
-            logits = -(2**15) * torch.ones_like(logits)
-            logits[..., self.eos_idx] = 2**15
-
-        # Suppress EoS to prevent early termination
-        print(
-            f"Suppressing EOS (cur_text_posn={cur_text_posn.item()}, self.text_position={self.text_position.item()}),  {T=}, {S=}, {self.curr_frame_pos=}, {self.text_tokens_slice=}, {self.complete=}, {self.completed_at=}"
-        )
-        if self.text_position < T - 3:  # FIXME: arbitrary
-            # Q:
-            #   - what if long_tail or repetition? then everything is set to -2**15
-            #   - cur_text_posn might be risky to use, why not use self.text_position?
-            logits[..., self.eos_idx] = -(2**15)
 
         return logits
