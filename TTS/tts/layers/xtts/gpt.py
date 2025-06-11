@@ -150,6 +150,7 @@ class GPT(nn.Module):
         )
         self.gpt.wte = self.mel_embedding
 
+        # NOTE: set to true for test purposes only
         use_deepspeed = True
         if use_deepspeed:
             import deepspeed
