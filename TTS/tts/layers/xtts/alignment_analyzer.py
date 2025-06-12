@@ -1,17 +1,78 @@
+import time
 from collections.abc import Callable
 from types import MethodType
+from typing import Any
 
 import torch
 from torch.utils.hooks import RemovableHandle
+from transformers.models.gpt2.modeling_gpt2 import GPT2Attention
+
+minus_inf = -10_000.0  # same constant used by DeepSpeed
+
+TOTAL_TIME = 0.0
+
+
+def _attention_forward_hook(module, inputs, output):
+    """
+    Return attention‐probs for the *current* query token(s) against *all* keys.
+    Works for prompt pass (T_q > 1) and incremental decoding (T_q == 1).
+
+    Forward output becomes:
+        (attn_out, key_layer, value_layer, context_layer, inp_norm, attn_probs)
+    """
+    global TOTAL_TIME
+    t0 = time.time()
+    # print(len(inputs))
+    # print(inputs[0].shape)
+    hidden_states, attn_mask, *rest = inputs  # (B, T_q, hidden)
+    key_layer = output[1]  # cached keys
+    B, T_q, _ = hidden_states.shape
+    H = module.num_attention_heads_per_partition
+    D = module.hidden_size_per_attention_head
+    norm = module.norm_factor if module.config.scale_attention else 1.0
+
+    # ---- 1. make QUERY in the same flattened (B*H) layout -------------------
+    W_qkv, b_qkv = module._attn_qkvw, module._attn_qkvb  # prepared by fwd
+    qkv = hidden_states @ W_qkv + b_qkv  # (B,T_q,3*hidden)
+    qkv = qkv.view(B, T_q, H, 3 * D)
+    query, _, _ = torch.chunk(qkv, 3, dim=-1)  # (B,T_q,H,D)
+    query = query.transpose(1, 2)  # (B,H,T_q,D)
+    query = query.reshape(B * H, T_q, D) / norm  # (*,T_q,D)
+
+    # ---- 2. KEY layout can vary a bit; standardise to (*,D,K) --------------
+    if key_layer.dim() == 4:  # (B,H,D,K)
+        key_flat = key_layer.view(B * H, D, -1)
+    else:  # (B*H, ?, ?)
+        # Detect where head_dim lives
+        if key_layer.shape[1] == D:
+            key_flat = key_layer  # (*,D,K)
+        else:  # (*,K,D)  → swap
+            key_flat = key_layer.transpose(1, 2)  # (*,D,K)
+
+    K_tot = key_flat.shape[-1]
+
+    # ---- 3. Dot-product -----------------------------------------------------
+    scores = torch.bmm(query, key_flat)  # (*,T_q,K)
+    scores = scores.view(B, H, T_q, K_tot)
+
+    # ---- 4. Apply mask in exactly the same spirit as DS --------------------
+    if attn_mask is not None:
+        if attn_mask.dtype == torch.bool:
+            attn_mask = attn_mask.long()
+        # make mask broadcastable -> (B,1,1,K_tot)
+        while attn_mask.dim() < 4:
+            attn_mask = attn_mask.unsqueeze(1)
+        scores += (1 - attn_mask).to(scores.dtype) * minus_inf
+
+    return torch.softmax(scores, dim=-1)  # (B,H,T_q,K_tot)
 
 
 class AlignmentAnalyzer:
     def __init__(
         self,
         alignment_layer: torch.nn.Module,
-        text_tokens_slice: tuple[int, int],
-        forward_output_to_attn_weights: Callable[[tuple], torch.Tensor],
-        eos_idx: int,
+        extract_attn_weights_fn: Callable[[torch.nn.Module, tuple[Any, ...], tuple[Any, ...]], torch.Tensor],
+        requires_forcing_output_attentions: bool = True,
     ):
         """
         Some transformer TTS models implicitly solve text-speech alignment in one or more of their self-attention
@@ -21,7 +82,15 @@ class AlignmentAnalyzer:
 
         NOTE: currently requires no queues.
         """
-        # self.queue = queue
+        # Using `output_attentions=True` is incompatible with optimized attention kernels, so
+        # using it for all layers slows things down too much. We can apply it to just one layer
+        # by intercepting the kwargs and adding a forward hook (credit: jrm)
+        self.alignment_layer = alignment_layer
+        self.requires_forcing_output_attentions = requires_forcing_output_attentions
+        self.extract_attn_weights_fn = extract_attn_weights_fn
+        self._initialized = False
+
+    def initialize(self, text_tokens_slice: tuple[int, int], eos_idx: int):
         self.text_tokens_slice = (i, j) = text_tokens_slice
         self.eos_idx = eos_idx
         self.alignment = torch.zeros(0, j - i)
@@ -34,18 +103,27 @@ class AlignmentAnalyzer:
 
         self.complete = False
         self.completed_at = None
-
-        # Using `output_attentions=True` is incompatible with optimized attention kernels, so
-        # using it for all layers slows things down too much. We can apply it to just one layer
-        # by intercepting the kwargs and adding a forward hook (credit: jrm)
         self.last_aligned_attn = None
-        self.alignment_layer = alignment_layer
-        self._add_attention_spy()
-        self.forward_output_to_attn_weights = forward_output_to_attn_weights
         self.hit_end_couter = 0
         self.did_hit_end = False
         self.hook_handle: RemovableHandle | None = None
         self.original_forward: Callable | None = None
+        self._add_attention_spy()
+        self._initialized = True
+
+    def reset(self):
+        """
+        Cleans up the alignment analyzer, unhooking the attention layer and resetting internal state.
+        """
+        print("Cleaning up AlignmentAnalyzer...")
+        self._initialized = False
+        # self.unhook()
+        self.alignment = None
+        self.last_aligned_attn = None
+        self.curr_frame_pos = 0
+        self.text_position = 0
+        self.hit_end_couter = 0
+        self.did_hit_end = False
 
     def unhook(self):
         """
@@ -73,33 +151,30 @@ class AlignmentAnalyzer:
         (credit: jrm)
         """
 
-        def attention_forward_hook(module, input, output):
-            """
-            See `LlamaAttention.forward`; the output is a 3-tuple: `attn_output, attn_weights, past_key_value`.
-            NOTE:
-            - When `output_attentions=True`, `LlamaSdpaAttention.forward` calls `LlamaAttention.forward`.
-            - `attn_output` has shape [B, H, T0, T0] for the 0th entry, and [B, H, 1, T0+i] for the rest i-th.
-            """
-            step_attention = self.forward_output_to_attn_weights(output).cpu()  # (B, 16, N, N)
-            self.last_aligned_attn = step_attention[0].mean(0)  # (N, N)
+        def attention_forward_hook(attn_module, inputs, output):
+            attn_weights = self.extract_attn_weights_fn(inputs, output)  # (B, 16, N, N)
+            self.last_aligned_attn = attn_weights[0].mean(0).cpu()  # (N, N)
 
         self.hook_handle = self.alignment_layer.register_forward_hook(attention_forward_hook)
 
-        # Backup original forward
-        original_forward = self.alignment_layer.forward
+        if self.requires_forcing_output_attentions:
+            original_forward = self.alignment_layer.forward
 
-        def patched_forward(_, *args, **kwargs):
-            kwargs["output_attentions"] = True
-            return original_forward(*args, **kwargs)
+            def patched_forward(_, *args, **kwargs):
+                kwargs["output_attentions"] = True
+                return original_forward(*args, **kwargs)
 
-        # TODO: how to unpatch it?
-        self.alignment_layer.forward = MethodType(patched_forward, self.alignment_layer)
-        self.original_forward = original_forward
+            self.alignment_layer.forward = MethodType(patched_forward, self.alignment_layer)
+            self.original_forward = original_forward
 
     def step(self, logits):
         """
         Emits an AlignmentAnalysisResult into the output queue, and potentially modifies the logits to force an EOS.
         """
+        if not self._initialized:
+            print("Warning: Trying to use AlignmentAnalyzer before initialization. Call initialize() first.")
+            return logits
+
         # extract approximate alignment matrix chunk (1 frame at a time after the first chunk)
         aligned_attn = self.last_aligned_attn  # (N, N)
         i, j = self.text_tokens_slice
@@ -138,41 +213,5 @@ class AlignmentAnalyzer:
             print("AlignmentAnalyzer: forcing EOS due to did_hit_end")
 
         self.curr_frame_pos += 1
-
-        return logits
-
-        # NOTE: EOS rarely assigned activations, and second-last token is often punctuation, so use last 3 tokens.
-        # NOTE: due to the false-start behaviour, we need to make sure we skip activations for the first few tokens.
-        # Q:
-        #   - didn't we already decided that the generation is complete?
-        #   - why not A[self.completed_at:, -3:]?
-        #   - also why not A[15:, -3] and just ignore punc and EOS?
-        #   - why do the sum ? it's influenced by the number of frames
-        last_text_token_duration = A[15:, -3:].sum()
-
-        # Activations for the final token that last too long are likely hallucinations.
-        # Q: how is the sum of activations gives you an estimate of the duration?
-        long_tail = self.complete and (A[self.completed_at :, -3:].sum(dim=0).max() >= 10)  # 400ms
-
-        # If there are activations in previous tokens after generation has completed, assume this is a repetition error.
-        repetition = self.complete and (A[self.completed_at :, :-5].max(dim=1).values.sum() > 5)
-
-        # If a bad ending is detected, force emit EOS by modifying logits
-        # NOTE: this means logits may be inconsistent with latents!
-        if long_tail or repetition:
-            print(f"forcing EOS token, {long_tail=}, {repetition=}")
-            # (Â±2**15 is safe for all dtypes >= 16bit)
-            logits = -(2**15) * torch.ones_like(logits)
-            logits[..., self.eos_idx] = 2**15
-
-        # Suppress EoS to prevent early termination
-        print(
-            f"Suppressing EOS (cur_text_posn={cur_text_posn.item()}, self.text_position={self.text_position.item()}),  {T=}, {S=}, {self.curr_frame_pos=}, {self.text_tokens_slice=}, {self.complete=}, {self.completed_at=}"
-        )
-        if self.text_position < T - 3:  # FIXME: arbitrary
-            # Q:
-            #   - what if long_tail or repetition? then everything is set to -2**15
-            #   - cur_text_posn might be risky to use, why not use self.text_position?
-            logits[..., self.eos_idx] = -(2**15)
 
         return logits
