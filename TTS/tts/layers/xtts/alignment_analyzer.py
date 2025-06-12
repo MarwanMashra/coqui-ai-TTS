@@ -1,6 +1,7 @@
 import time
 from collections.abc import Callable
 from types import MethodType
+from typing import Any
 
 import torch
 from torch.utils.hooks import RemovableHandle
@@ -70,8 +71,8 @@ class AlignmentAnalyzer:
     def __init__(
         self,
         alignment_layer: torch.nn.Module,
-        forward_with_attn_weights_fn: Callable,
-        set_output_attentions: bool = True,
+        extract_attn_weights_fn: Callable[[torch.nn.Module, tuple[Any, ...], tuple[Any, ...]], torch.Tensor],
+        requires_forcing_output_attentions: bool = True,
     ):
         """
         Some transformer TTS models implicitly solve text-speech alignment in one or more of their self-attention
@@ -85,9 +86,9 @@ class AlignmentAnalyzer:
         # using it for all layers slows things down too much. We can apply it to just one layer
         # by intercepting the kwargs and adding a forward hook (credit: jrm)
         self.alignment_layer = alignment_layer
-        self.set_output_attentions = set_output_attentions
-        self.forward_with_attn_weights_fn = forward_with_attn_weights_fn
-        self.is_initialized = False
+        self.requires_forcing_output_attentions = requires_forcing_output_attentions
+        self.extract_attn_weights_fn = extract_attn_weights_fn
+        self._initialized = False
 
     def initialize(self, text_tokens_slice: tuple[int, int], eos_idx: int):
         self.text_tokens_slice = (i, j) = text_tokens_slice
@@ -108,14 +109,14 @@ class AlignmentAnalyzer:
         self.hook_handle: RemovableHandle | None = None
         self.original_forward: Callable | None = None
         self._add_attention_spy()
-        self.is_initialized = True
+        self._initialized = True
 
     def reset(self):
         """
         Cleans up the alignment analyzer, unhooking the attention layer and resetting internal state.
         """
         print("Cleaning up AlignmentAnalyzer...")
-        self.is_initialized = False
+        self._initialized = False
         # self.unhook()
         self.alignment = None
         self.last_aligned_attn = None
@@ -150,29 +151,27 @@ class AlignmentAnalyzer:
         (credit: jrm)
         """
 
-        def attention_forward_hook(module, inputs, output):
-            attn_weights = self.forward_with_attn_weights_fn(inputs, output)  # (B, 16, N, N)
+        def attention_forward_hook(attn_module, inputs, output):
+            attn_weights = self.extract_attn_weights_fn(inputs, output)  # (B, 16, N, N)
             self.last_aligned_attn = attn_weights[0].mean(0).cpu()  # (N, N)
 
         self.hook_handle = self.alignment_layer.register_forward_hook(attention_forward_hook)
 
-        # Backup original forward
-        original_forward = self.alignment_layer.forward
+        if self.requires_forcing_output_attentions:
+            original_forward = self.alignment_layer.forward
 
-        def patched_forward(_, *args, **kwargs):
-            if self.set_output_attentions:
+            def patched_forward(_, *args, **kwargs):
                 kwargs["output_attentions"] = True
-            return original_forward(*args, **kwargs)
+                return original_forward(*args, **kwargs)
 
-        # TODO: how to unpatch it?
-        self.alignment_layer.forward = MethodType(patched_forward, self.alignment_layer)
-        self.original_forward = original_forward
+            self.alignment_layer.forward = MethodType(patched_forward, self.alignment_layer)
+            self.original_forward = original_forward
 
     def step(self, logits):
         """
         Emits an AlignmentAnalysisResult into the output queue, and potentially modifies the logits to force an EOS.
         """
-        if not self.is_initialized:
+        if not self._initialized:
             print("Warning: Trying to use AlignmentAnalyzer before initialization. Call initialize() first.")
             return logits
 

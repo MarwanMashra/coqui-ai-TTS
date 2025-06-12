@@ -6,7 +6,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import GPT2Config
-from transformers.models.gpt2.modeling_gpt2 import GPT2Attention
 
 from TTS.tts.layers.tortoise.autoregressive import (
     ConditioningEncoder,
@@ -155,11 +154,16 @@ class GPT(nn.Module):
         self.gpt.wte = self.mel_embedding
 
         # NOTE: set to true for test purposes only
-        use_deepspeed = False
+        use_deepspeed = True
         if use_deepspeed:
             import deepspeed
+            from transformers.models.gpt2.modeling_gpt2 import GPT2Attention
 
-            original_alignment_layer: GPT2Attention = self.gpt.h[self.alignment_layer_idx].attn.to("cuda")
+            # Deepspeed attention layers don't allow us to get back attn weights even when output_attentions=True
+            # therefore, we have to either recompute attn weights ourselves, or use the original GPT2Attention layer
+            # store the original GPT2Attention layer before it get replaced by deepspeed attention layer
+            gpt2_attn_layer: GPT2Attention = self.gpt.h[self.alignment_layer_idx].attn.to("cuda")
+
             self.ds_engine = deepspeed.init_inference(
                 model=self.gpt_inference.half(),  # Transformers models
                 mp_size=1,  # Number of GPU
@@ -169,10 +173,10 @@ class GPT(nn.Module):
             )
             self.gpt_inference = self.ds_engine.module.eval()
 
-            def forward_with_attn(inputs, output):
+            def recompute_attn_with_gpt2_layer(inputs, outputs):
                 _, input_mask, head_mask, layer_past, *_ = inputs
-                return original_alignment_layer.forward(
-                    hidden_states=output[-1],
+                return gpt2_attn_layer.forward(
+                    hidden_states=outputs[-1],  # outputs=(output, key_layer, value_layer, context_layer, inp_norm)
                     layer_past=layer_past,
                     attention_mask=input_mask,
                     head_mask=head_mask,
@@ -181,14 +185,14 @@ class GPT(nn.Module):
 
             self.alignment_analyzer = AlignmentAnalyzer(
                 self.gpt_inference.transformer.h[self.alignment_layer_idx].attention,
-                forward_with_attn_weights_fn=forward_with_attn,
-                set_output_attentions=False,
+                extract_attn_weights_fn=recompute_attn_with_gpt2_layer,
+                requires_forcing_output_attentions=False,
             )
         else:
             self.alignment_analyzer = AlignmentAnalyzer(
                 self.gpt_inference.transformer.h[self.alignment_layer_idx].attn,
-                forward_with_attn_weights_fn=lambda _, output: output[2],
-                set_output_attentions=True,
+                extract_attn_weights_fn=lambda _, outputs: outputs[2],
+                requires_forcing_output_attentions=True,
             )
 
         self.gpt_inference.set_alignment_analyzer(self.alignment_analyzer)
