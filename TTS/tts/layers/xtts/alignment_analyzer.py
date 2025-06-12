@@ -70,10 +70,7 @@ class AlignmentAnalyzer:
     def __init__(
         self,
         alignment_layer: torch.nn.Module,
-        layer: torch.nn.Module,
-        text_tokens_slice: tuple[int, int],
-        forward_output_to_attn_weights: Callable[[tuple], torch.Tensor],
-        eos_idx: int,
+        forward_with_attn_weights_fn: Callable,
         set_output_attentions: bool = True,
     ):
         """
@@ -84,7 +81,15 @@ class AlignmentAnalyzer:
 
         NOTE: currently requires no queues.
         """
-        # self.queue = queue
+        # Using `output_attentions=True` is incompatible with optimized attention kernels, so
+        # using it for all layers slows things down too much. We can apply it to just one layer
+        # by intercepting the kwargs and adding a forward hook (credit: jrm)
+        self.alignment_layer = alignment_layer
+        self.set_output_attentions = set_output_attentions
+        self.forward_with_attn_weights_fn = forward_with_attn_weights_fn
+        self.is_initialized = False
+
+    def initialize(self, text_tokens_slice: tuple[int, int], eos_idx: int):
         self.text_tokens_slice = (i, j) = text_tokens_slice
         self.eos_idx = eos_idx
         self.alignment = torch.zeros(0, j - i)
@@ -97,20 +102,27 @@ class AlignmentAnalyzer:
 
         self.complete = False
         self.completed_at = None
-
-        # Using `output_attentions=True` is incompatible with optimized attention kernels, so
-        # using it for all layers slows things down too much. We can apply it to just one layer
-        # by intercepting the kwargs and adding a forward hook (credit: jrm)
         self.last_aligned_attn = None
-        self.alignment_layer = alignment_layer
-        self._add_attention_spy()
-        self.forward_output_to_attn_weights = forward_output_to_attn_weights
         self.hit_end_couter = 0
         self.did_hit_end = False
         self.hook_handle: RemovableHandle | None = None
         self.original_forward: Callable | None = None
-        self.pre_deepspeed_alignment_layer: GPT2Attention = layer
-        self.set_output_attentions = set_output_attentions
+        self._add_attention_spy()
+        self.is_initialized = True
+
+    def reset(self):
+        """
+        Cleans up the alignment analyzer, unhooking the attention layer and resetting internal state.
+        """
+        print("Cleaning up AlignmentAnalyzer...")
+        self.is_initialized = False
+        # self.unhook()
+        self.alignment = None
+        self.last_aligned_attn = None
+        self.curr_frame_pos = 0
+        self.text_position = 0
+        self.hit_end_couter = 0
+        self.did_hit_end = False
 
     def unhook(self):
         """
@@ -139,16 +151,8 @@ class AlignmentAnalyzer:
         """
 
         def attention_forward_hook(module, inputs, output):
-            _, input_mask, head_mask, layer_past, *_ = inputs
-            output = self.pre_deepspeed_alignment_layer.forward(
-                hidden_states=output[-1],
-                layer_past=layer_past,
-                attention_mask=input_mask,
-                head_mask=head_mask,
-                output_attentions=True,
-            )
-            step_attention = output[2][0].mean(0)  # (B, 16, N, N)
-            self.last_aligned_attn = step_attention.cpu()  # (N, N)
+            attn_weights = self.forward_with_attn_weights_fn(inputs, output)  # (B, 16, N, N)
+            self.last_aligned_attn = attn_weights[0].mean(0).cpu()  # (N, N)
 
         self.hook_handle = self.alignment_layer.register_forward_hook(attention_forward_hook)
 
@@ -168,6 +172,10 @@ class AlignmentAnalyzer:
         """
         Emits an AlignmentAnalysisResult into the output queue, and potentially modifies the logits to force an EOS.
         """
+        if not self.is_initialized:
+            print("Warning: Trying to use AlignmentAnalyzer before initialization. Call initialize() first.")
+            return logits
+
         # extract approximate alignment matrix chunk (1 frame at a time after the first chunk)
         aligned_attn = self.last_aligned_attn  # (N, N)
         i, j = self.text_tokens_slice

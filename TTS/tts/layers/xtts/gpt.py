@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import GPT2Config
+from transformers.models.gpt2.modeling_gpt2 import GPT2Attention
 
 from TTS.tts.layers.tortoise.autoregressive import (
     ConditioningEncoder,
@@ -13,11 +14,14 @@ from TTS.tts.layers.tortoise.autoregressive import (
     _prepare_attention_mask_for_generation,
     build_hf_gpt_transformer,
 )
+from TTS.tts.layers.xtts.alignment_analyzer import AlignmentAnalyzer
 from TTS.tts.layers.xtts.gpt_inference import GPT2InferenceModel
 from TTS.tts.layers.xtts.perceiver_encoder import PerceiverResampler
 
 
 class GPT(nn.Module):
+    alignment_layer_idx: int = 12  # hparam, the layer that has the alignment information
+
     def __init__(
         self,
         start_text_token=261,
@@ -151,10 +155,11 @@ class GPT(nn.Module):
         self.gpt.wte = self.mel_embedding
 
         # NOTE: set to true for test purposes only
-        use_deepspeed = True
+        use_deepspeed = False
         if use_deepspeed:
             import deepspeed
 
+            original_alignment_layer: GPT2Attention = self.gpt.h[self.alignment_layer_idx].attn.to("cuda")
             self.ds_engine = deepspeed.init_inference(
                 model=self.gpt_inference.half(),  # Transformers models
                 mp_size=1,  # Number of GPU
@@ -163,6 +168,30 @@ class GPT(nn.Module):
                 replace_with_kernel_inject=True,  # replace the model with the kernel injector
             )
             self.gpt_inference = self.ds_engine.module.eval()
+
+            def forward_with_attn(inputs, output):
+                _, input_mask, head_mask, layer_past, *_ = inputs
+                return original_alignment_layer.forward(
+                    hidden_states=output[-1],
+                    layer_past=layer_past,
+                    attention_mask=input_mask,
+                    head_mask=head_mask,
+                    output_attentions=True,
+                )[2]
+
+            self.alignment_analyzer = AlignmentAnalyzer(
+                self.gpt_inference.transformer.h[self.alignment_layer_idx].attention,
+                forward_with_attn_weights_fn=forward_with_attn,
+                set_output_attentions=False,
+            )
+        else:
+            self.alignment_analyzer = AlignmentAnalyzer(
+                self.gpt_inference.transformer.h[self.alignment_layer_idx].attn,
+                forward_with_attn_weights_fn=lambda _, output: output[2],
+                set_output_attentions=True,
+            )
+
+        self.gpt_inference.set_alignment_analyzer(self.alignment_analyzer)
 
     def set_inputs_and_targets(self, input, start_token, stop_token):
         inp = F.pad(input, (1, 0), value=start_token)
@@ -513,9 +542,12 @@ class GPT(nn.Module):
         gpt_inputs = self.compute_embeddings(cond_latents, text_inputs)
         stop_token_tensor = torch.tensor(self.stop_audio_token, device=gpt_inputs.device, dtype=torch.long)
         attention_mask = _prepare_attention_mask_for_generation(gpt_inputs, stop_token_tensor, stop_token_tensor)
+        self.alignment_analyzer.initialize(
+            text_tokens_slice=(cond_latents.size(1), cond_latents.size(1) + text_inputs.size(1) + 2),
+            eos_idx=self.stop_audio_token,
+        )
         gen = self.gpt_inference.generate(
-            (cond_latents.size(1), cond_latents.size(1) + text_inputs.size(1) + 2),
-            inputs=gpt_inputs,
+            gpt_inputs,
             bos_token_id=self.start_audio_token,
             pad_token_id=self.stop_audio_token,
             eos_token_id=self.stop_audio_token,
@@ -523,6 +555,7 @@ class GPT(nn.Module):
             attention_mask=attention_mask,
             **hf_generate_kwargs,
         )
+        self.alignment_analyzer.reset()
         if "return_dict_in_generate" in hf_generate_kwargs:
             return gen.sequences[:, gpt_inputs.shape[1] :], gen
         return gen[:, gpt_inputs.shape[1] :]
