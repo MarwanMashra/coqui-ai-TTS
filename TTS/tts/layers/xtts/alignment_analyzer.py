@@ -1,217 +1,296 @@
-import time
+"""
+alignment_analyzer.py
+=====================
+
+**Purpose**
+
+Detect when a streaming text-to-speech decoder has lost alignment with the
+prompt text and force an early **EOS** token to suppress tail-hallucinations
+and silence.
+
+The heuristic fuses three independent signals:
+
+1. **Visited-edge stall**
+   *We expect forward momentum.*
+   A running “edge” marks the highest prompt token that has been confirmed
+   by attention.  If the arg-max attention index (`arg_max`) sits more than
+   `EDGE_BACK_TOLERANCE` tokens **behind** that edge in a high percentage of
+   the last `STALE_WINDOW_FRAMES` frames, generation is declared *stagnant*.
+
+2. **“Stuck-at-start” loop**
+   Many pathological runs bounce on **prompt token 1** (typically the comma
+   after a greeting) and never recover.  If `arg_max` has been exactly
+   `START_STUCK_IDX` (hard-wired = 1) in ≥ `START_STUCK_RATIO_CUTOFF`
+   of the last `START_STUCK_WINDOW_FRAMES` frames, we cut.
+
+3. **EOS hold**
+   Once the visited edge reaches the final prompt token, we allow the model
+   `EOS_HOLD_FRAMES` more frames to output trailing silence; after that we cut.
+
+**How the visited edge advances**
+
+* Let `cursor` be a smoothed version of `arg_max` that only updates when
+  `arg_max` lies inside an acceptance window
+  `[cursor − CURSOR_WINDOW_LEFT , cursor + CURSOR_WINDOW_RIGHT]`.
+* Every frame each **unvisited** token *between the current edge and
+  `min(cursor, arg_max)`* accrues a hit.
+* A token `t` becomes *visited* once its consecutive hit count ≥
+
+      VISIT_BASE_FRAMES + ceil((t − edge − 1) × VISIT_JUMP_SCALE).
+
+  Longer jumps thus require proportionally longer confirmation.
+* When several contiguous tokens satisfy the rule simultaneously, the edge
+  can advance by more than one token in a single frame.
+
+Set `verbose=True` in the constructor and enable the module logger at
+DEBUG level to see frame-by-frame traces.  All thresholds are module-level
+constants and can be tuned empirically.
+"""
+
+from __future__ import annotations
+
+import math
+from collections import deque
 from collections.abc import Callable
-from types import MethodType
-from typing import Any
+from types import FunctionType, MethodType
+from typing import Optional
 
 import torch
 from torch.utils.hooks import RemovableHandle
-from transformers.models.gpt2.modeling_gpt2 import GPT2Attention
-
-minus_inf = -10_000.0  # same constant used by DeepSpeed
-
-TOTAL_TIME = 0.0
-
-
-def _attention_forward_hook(module, inputs, output):
-    """
-    Return attention‐probs for the *current* query token(s) against *all* keys.
-    Works for prompt pass (T_q > 1) and incremental decoding (T_q == 1).
-
-    Forward output becomes:
-        (attn_out, key_layer, value_layer, context_layer, inp_norm, attn_probs)
-    """
-    global TOTAL_TIME
-    t0 = time.time()
-    # print(len(inputs))
-    # print(inputs[0].shape)
-    hidden_states, attn_mask, *rest = inputs  # (B, T_q, hidden)
-    key_layer = output[1]  # cached keys
-    B, T_q, _ = hidden_states.shape
-    H = module.num_attention_heads_per_partition
-    D = module.hidden_size_per_attention_head
-    norm = module.norm_factor if module.config.scale_attention else 1.0
-
-    # ---- 1. make QUERY in the same flattened (B*H) layout -------------------
-    W_qkv, b_qkv = module._attn_qkvw, module._attn_qkvb  # prepared by fwd
-    qkv = hidden_states @ W_qkv + b_qkv  # (B,T_q,3*hidden)
-    qkv = qkv.view(B, T_q, H, 3 * D)
-    query, _, _ = torch.chunk(qkv, 3, dim=-1)  # (B,T_q,H,D)
-    query = query.transpose(1, 2)  # (B,H,T_q,D)
-    query = query.reshape(B * H, T_q, D) / norm  # (*,T_q,D)
-
-    # ---- 2. KEY layout can vary a bit; standardise to (*,D,K) --------------
-    if key_layer.dim() == 4:  # (B,H,D,K)
-        key_flat = key_layer.view(B * H, D, -1)
-    else:  # (B*H, ?, ?)
-        # Detect where head_dim lives
-        if key_layer.shape[1] == D:
-            key_flat = key_layer  # (*,D,K)
-        else:  # (*,K,D)  → swap
-            key_flat = key_layer.transpose(1, 2)  # (*,D,K)
-
-    K_tot = key_flat.shape[-1]
-
-    # ---- 3. Dot-product -----------------------------------------------------
-    scores = torch.bmm(query, key_flat)  # (*,T_q,K)
-    scores = scores.view(B, H, T_q, K_tot)
-
-    # ---- 4. Apply mask in exactly the same spirit as DS --------------------
-    if attn_mask is not None:
-        if attn_mask.dtype == torch.bool:
-            attn_mask = attn_mask.long()
-        # make mask broadcastable -> (B,1,1,K_tot)
-        while attn_mask.dim() < 4:
-            attn_mask = attn_mask.unsqueeze(1)
-        scores += (1 - attn_mask).to(scores.dtype) * minus_inf
-
-    return torch.softmax(scores, dim=-1)  # (B,H,T_q,K_tot)
 
 
 class AlignmentAnalyzer:
+    # ───────────────────────── Tunables ──────────────────────────
+    CURSOR_WINDOW_LEFT = 2
+    CURSOR_WINDOW_RIGHT = 4
+
+    VISIT_BASE_FRAMES = 3
+    VISIT_JUMP_SCALE = 0.5
+
+    EDGE_BACK_TOLERANCE = 0
+
+    STALE_WINDOW_FRAMES = 15
+    STALE_RATIO_CUTOFF = 0.80
+    STALE_MIN_FILL = STALE_WINDOW_FRAMES // 2
+
+    EOS_HOLD_FRAMES = 4
+
+    # “stuck at the very beginning” guard (token index 1 is hard-wired)
+    START_STUCK_IDX = 1
+    START_STUCK_WINDOW_FRAMES = 10
+    START_STUCK_RATIO_CUTOFF = 0.80
+    # ------------------------------------------------------------
+
     def __init__(
         self,
-        alignment_layer: torch.nn.Module,
-        extract_attn_weights_fn: Callable[[torch.nn.Module, tuple[Any, ...], tuple[Any, ...]], torch.Tensor],
-        requires_forcing_output_attentions: bool = True,
-    ):
+        attention_layer: torch.nn.Module,
+        extract_attention: Callable[[torch.nn.Module, tuple, tuple], torch.Tensor],
+        *,
+        force_output_attention: bool = True,
+        verbose: bool = False,
+    ) -> None:
         """
-        Some transformer TTS models implicitly solve text-speech alignment in one or more of their self-attention
-        activation maps. This module exploits this to perform online integrity checks which streaming.
-        A hook is injected into the specified attention layer, and heuristics are used to determine alignment
-        position, repetition, etc.
-
-        NOTE: currently requires no queues.
+        Parameters
+        ----------
+        attention_layer
+            Decoder self-attention layer to observe.
+        extract_attention
+            Callback returning (B, heads, N, N) attention given
+            (module, inputs, output).
+        force_output_attention
+            Patch the target layer so it always emits its attention map.
+        verbose
+            If `True`, print frame-by-frame debug traces to the console.
         """
-        # Using `output_attentions=True` is incompatible with optimized attention kernels, so
-        # using it for all layers slows things down too much. We can apply it to just one layer
-        # by intercepting the kwargs and adding a forward hook (credit: jrm)
-        self.alignment_layer = alignment_layer
-        self.requires_forcing_output_attentions = requires_forcing_output_attentions
-        self.extract_attn_weights_fn = extract_attn_weights_fn
-        self._initialized = False
+        self._layer = attention_layer
+        self._extract_attention = extract_attention
+        self._force_output_attention = force_output_attention
+        self._verbose = verbose
 
-    def initialize(self, text_tokens_slice: tuple[int, int], eos_idx: int):
-        self.text_tokens_slice = (i, j) = text_tokens_slice
-        self.eos_idx = eos_idx
-        self.alignment = torch.zeros(0, j - i)
-        # self.alignment_bin = torch.zeros(0, j-i)
-        self.curr_frame_pos = 0
-        self.text_position = 0
+        # runtime state filled by `initialize`
+        self._hook: Optional[RemovableHandle] = None
+        self._orig_forward: Optional[FunctionType] = None
+        self._last_attention: Optional[torch.Tensor] = None
+        self._ready = False
 
-        self.started = False
-        self.started_at = None
+    # ─────────────────────── Public API ──────────────────────────
 
-        self.complete = False
-        self.completed_at = None
-        self.last_aligned_attn = None
-        self.hit_end_couter = 0
-        self.did_hit_end = False
-        self.hook_handle: RemovableHandle | None = None
-        self.original_forward: Callable | None = None
-        self._add_attention_spy()
-        self._initialized = True
-
-    def reset(self):
+    def initialize(self, text_span: tuple[int, int], eos_token_id: int) -> None:
         """
-        Cleans up the alignment analyzer, unhooking the attention layer and resetting internal state.
+        Initialize internal state to get ready for a new generation pass.
+
+        Parameters
+        ----------
+        text_span
+            (start, end) slice of prompt tokens inside model sequence.
+        eos_token_id
+            Vocabulary id for EOS token.
         """
-        print("Cleaning up AlignmentAnalyzer...")
-        self._initialized = False
-        # self.unhook()
-        self.alignment = None
-        self.last_aligned_attn = None
-        self.curr_frame_pos = 0
-        self.text_position = 0
-        self.hit_end_couter = 0
-        self.did_hit_end = False
+        start, end = text_span
+        self._text_len = end - start
+        self._span = text_span
+        self._eos_id = eos_token_id
 
-    def unhook(self):
-        """
-        Unhooks the attention layer to stop collecting outputs and restore the original forward method.
-        """
-        print("Unhooking AlignmentAnalyzer...")
-        # NOTE: this doesn't work, both are None
-        if self.hook_handle is not None:
-            print("Removing hook from alignment layer")
-            self.hook_handle.remove()
-            self.hook_handle = None
+        # counters & trackers
+        self._frame = 0
+        self._alignment = torch.zeros(0, self._text_len)
 
-        # Restore original forward method
-        if self.original_forward is not None:
-            print("Restoring original forward method of alignment layer")
-            self.alignment_layer.forward = MethodType(self.original_forward, self.alignment_layer)
-            self.original_forward = None
-            print("self.alignment_layer.forward:", self.alignment_layer.forward)
+        self._cursor = 0
+        self._streak = [0] * self._text_len
+        self._visited = [False] * self._text_len
+        self._edge = -1
 
-    def _add_attention_spy(self):
-        """
-        Adds a forward hook to a specific attention layer to collect outputs.
-        Using `output_attentions=True` is incompatible with optimized attention kernels, so
-        using it for all layers slows things down too much.
-        (credit: jrm)
-        """
+        self._stale_hist: deque[bool] = deque(maxlen=self.STALE_WINDOW_FRAMES)
+        self._stuck_hist: deque[bool] = deque(maxlen=self.START_STUCK_WINDOW_FRAMES)
+        self._eos_hold = 0
 
-        def attention_forward_hook(attn_module, inputs, output):
-            attn_weights = self.extract_attn_weights_fn(inputs, output)  # (B, 16, N, N)
-            self.last_aligned_attn = attn_weights[0].mean(0).cpu()  # (N, N)
+        self._attach_hook()
+        self._ready = True
 
-        self.hook_handle = self.alignment_layer.register_forward_hook(attention_forward_hook)
+    def reset(self) -> None:
+        """Detach the attention hook and clear state."""
+        self._detach_hook()
+        self._ready = False
 
-        if self.requires_forcing_output_attentions:
-            original_forward = self.alignment_layer.forward
+    # ───────────────────────── Main step ──────────────────────────
 
-            def patched_forward(_, *args, **kwargs):
-                kwargs["output_attentions"] = True
-                return original_forward(*args, **kwargs)
-
-            self.alignment_layer.forward = MethodType(patched_forward, self.alignment_layer)
-            self.original_forward = original_forward
-
-    def step(self, logits):
-        """
-        Emits an AlignmentAnalysisResult into the output queue, and potentially modifies the logits to force an EOS.
-        """
-        if not self._initialized:
-            print("Warning: Trying to use AlignmentAnalyzer before initialization. Call initialize() first.")
+    @torch.no_grad()
+    def step(self, logits: torch.Tensor) -> torch.Tensor:
+        if not self._ready:
             return logits
 
-        # extract approximate alignment matrix chunk (1 frame at a time after the first chunk)
-        aligned_attn = self.last_aligned_attn  # (N, N)
-        i, j = self.text_tokens_slice
-        if self.curr_frame_pos == 0:
-            # first chunk has conditioning info, text tokens, and BOS token
-            A_chunk = aligned_attn[j:, i:j].clone().cpu()  # (T, S)
-        else:
-            # subsequent chunks have 1 frame due to KV-caching
-            A_chunk = aligned_attn[:, i:j].clone().cpu()  # (1, S)
-        A_chunk[:, 0] = 0
+        arg_max = self._ingest_attention()
+        self._update_cursor(arg_max)
+        self._update_streaks(arg_max)
+        self._advance_edge()
+        self._update_stale(arg_max)
+        self._update_stuck(arg_max)
+        self._update_eos_hold()
 
-        self.alignment = torch.cat((self.alignment, A_chunk), dim=0)
+        if self._should_cut():
+            logits.fill_(-(2**15))
+            logits[..., self._eos_id] = 2**15
+            if self._verbose:
+                print(
+                    f"AlignmentAnalyzer: force EOS | edge={self._edge} stale={self._stale_ratio:.2f} "
+                    f"stuck={self._stuck_ratio:.2f} eos={self._eos_hold}"
+                )
 
-        A = self.alignment
-        S, T = A.shape  # Q: so T is speech tokens, S is text tokens? weird naming...
+        if self._verbose:
+            print(
+                f"AlignmentAnalyzer: F{self._frame:04d} | arg={arg_max:3d} cur={self._cursor:3d} edge={self._edge:3d} "
+                f"dist={self._cursor - self._edge:2d} stale={self._stale_hist[-1] if self._stale_hist else False}({self._stale_ratio:.2f}) "
+                f"stuck={self._stuck_hist[-1] if self._stuck_hist else False}({self._stuck_ratio:.2f}) "
+                f"eos={self._eos_hold} cut={self._should_cut()}"
+            )
 
-        # update position
-        # print(A_chunk[-1])
-        cur_text_posn = A_chunk[-1].argmax()
-        continuity = -4 < cur_text_posn - self.text_position < 7  # NOTE: very lenient!
-        if continuity:
-            self.text_position = cur_text_posn
-
-        if self.text_position == T - 1:
-            self.hit_end_couter += 1
-            if self.hit_end_couter > 3:
-                self.did_hit_end = True
-
-        print(
-            f"AlignmentAnalyzer: {self.curr_frame_pos=}, cur_text_posn={cur_text_posn}, {self.text_position=}, text_len={T}"
-        )
-
-        if self.did_hit_end and cur_text_posn < T - 1:
-            logits = -(2**15) * torch.ones_like(logits)
-            logits[..., self.eos_idx] = 2**15
-            print("AlignmentAnalyzer: forcing EOS due to did_hit_end")
-
-        self.curr_frame_pos += 1
-
+        self._frame += 1
         return logits
+
+    # ─────────────────── Internal mechanics ──────────────────────
+
+    # Attention ingestion ----------------------------------------------------
+    def _ingest_attention(self) -> int:
+        start, end = self._span
+        attn = self._last_attention
+        row = attn[end:, start:end] if self._frame == 0 else attn[:, start:end]
+        row = row.clone().cpu()
+        row[:, 0] = 0  # mask BOS
+        self._alignment = torch.cat((self._alignment, row), 0)
+        return int(row[-1].argmax())
+
+    # Cursor smoothing ------------------------------------------------------
+    def _update_cursor(self, arg_max: int) -> None:
+        """
+        Move the smoothing cursor.
+
+        * Follow the arg-max if it lies within the acceptance window
+        [cursor−L , cursor+R] (usual case).
+        * If the arg-max lies **outside** that range, re-center the cursor
+        immediately.  This prevents the “stuck-since-frame-0” bug.
+        """
+        if arg_max < self._cursor - self.CURSOR_WINDOW_LEFT or arg_max > self._cursor + self.CURSOR_WINDOW_RIGHT:
+            self._cursor = arg_max
+        elif (
+            self._frame == 0
+            or self._cursor - self.CURSOR_WINDOW_LEFT <= arg_max <= self._cursor + self.CURSOR_WINDOW_RIGHT
+        ):
+            self._cursor = arg_max
+
+    # Per-token consecutive streaks -----------------------------------------
+    def _update_streaks(self, arg_max: int) -> None:
+        start = self._edge + 1
+        end = min(arg_max, self._cursor)
+        for idx in range(start, end + 1):
+            self._streak[idx] += 1
+        for idx in range(end + 1, self._text_len):
+            if not self._visited[idx]:
+                self._streak[idx] = 0
+
+    def _advance_edge(self) -> None:
+        idx = self._edge + 1
+        while idx < self._text_len:
+            if self._visited[idx]:
+                idx += 1
+                continue
+            distance = idx - self._edge
+            required = self.VISIT_BASE_FRAMES + math.ceil((distance - 1) * self.VISIT_JUMP_SCALE)
+            if self._streak[idx] >= required:
+                self._visited[idx] = True
+                idx += 1
+            else:
+                break
+        while self._edge + 1 < self._text_len and self._visited[self._edge + 1]:
+            self._edge += 1
+
+    # Staleness detection ----------------------------------------------------
+    def _update_stale(self, arg_max: int) -> None:
+        stale = arg_max < self._edge - self.EDGE_BACK_TOLERANCE
+        self._stale_hist.append(stale)
+        self._stale_ratio = sum(self._stale_hist) / len(self._stale_hist)
+
+    # “Stuck at start” detection --------------------------------------------
+    def _update_stuck(self, arg_max: int) -> None:
+        self._stuck_hist.append(arg_max == self.START_STUCK_IDX)
+        self._stuck_ratio = sum(self._stuck_hist) / len(self._stuck_hist)
+
+    # EOS hold ---------------------------------------------------------------
+    def _update_eos_hold(self) -> None:
+        at_end = self._edge >= self._text_len - 1
+        self._eos_hold = self._eos_hold + 1 if at_end else 0
+
+    # Final cut decision -----------------------------------------------------
+    def _should_cut(self) -> bool:
+        # NOTE: stagnant condition is dangerous, maybe remove it?
+        # stagnant = len(self._stale_hist) >= self.STALE_MIN_FILL and self._stale_ratio >= self.STALE_RATIO_CUTOFF
+        stagnant = False
+        stuck_loop = (
+            len(self._stuck_hist) == self.START_STUCK_WINDOW_FRAMES
+            and self._stuck_ratio >= self.START_STUCK_RATIO_CUTOFF
+        )
+        eos_done = self._eos_hold >= self.EOS_HOLD_FRAMES
+        return stagnant or stuck_loop or eos_done
+
+    # Hook plumbing ----------------------------------------------------------
+    def _attach_hook(self) -> None:
+        def _hook(_, inputs, output):
+            self._last_attention = self._extract_attention(_, inputs, output)[0].mean(0).cpu()
+
+        self._hook = self._layer.register_forward_hook(_hook)
+
+        if self._force_output_attention:
+            self._orig_forward = self._layer.forward
+
+            def _forward(_, *a, **kw):
+                kw["output_attentions"] = True
+                return self._orig_forward(*a, **kw)
+
+            self._layer.forward = MethodType(_forward, self._layer)
+
+    def _detach_hook(self) -> None:
+        if self._hook:
+            self._hook.remove()
+            self._hook = None
+        if self._orig_forward:
+            self._layer.forward = MethodType(self._orig_forward, self._layer)
+            self._orig_forward = None

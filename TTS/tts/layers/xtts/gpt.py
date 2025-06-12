@@ -173,7 +173,7 @@ class GPT(nn.Module):
             )
             self.gpt_inference = self.ds_engine.module.eval()
 
-            def recompute_attn_with_gpt2_layer(inputs, outputs):
+            def recompute_attn_with_gpt2_layer(module, inputs, outputs):
                 _, input_mask, head_mask, layer_past, *_ = inputs
                 return gpt2_attn_layer.forward(
                     hidden_states=outputs[-1],  # outputs=(output, key_layer, value_layer, context_layer, inp_norm)
@@ -185,14 +185,16 @@ class GPT(nn.Module):
 
             self.alignment_analyzer = AlignmentAnalyzer(
                 self.gpt_inference.transformer.h[self.alignment_layer_idx].attention,
-                extract_attn_weights_fn=recompute_attn_with_gpt2_layer,
-                requires_forcing_output_attentions=False,
+                extract_attention=recompute_attn_with_gpt2_layer,
+                force_output_attention=False,
+                verbose=True,  # for debugging purposes
             )
         else:
             self.alignment_analyzer = AlignmentAnalyzer(
                 self.gpt_inference.transformer.h[self.alignment_layer_idx].attn,
-                extract_attn_weights_fn=lambda _, outputs: outputs[2],
-                requires_forcing_output_attentions=True,
+                extract_attention=lambda module, inputs, outputs: outputs[2],
+                force_output_attention=True,
+                verbose=True,  # for debugging purposes
             )
 
         self.gpt_inference.set_alignment_analyzer(self.alignment_analyzer)
@@ -547,8 +549,8 @@ class GPT(nn.Module):
         stop_token_tensor = torch.tensor(self.stop_audio_token, device=gpt_inputs.device, dtype=torch.long)
         attention_mask = _prepare_attention_mask_for_generation(gpt_inputs, stop_token_tensor, stop_token_tensor)
         self.alignment_analyzer.initialize(
-            text_tokens_slice=(cond_latents.size(1), cond_latents.size(1) + text_inputs.size(1) + 2),
-            eos_idx=self.stop_audio_token,
+            text_span=(cond_latents.size(1), cond_latents.size(1) + text_inputs.size(1) + 2),
+            eos_token_id=self.stop_audio_token,
         )
         gen = self.gpt_inference.generate(
             gpt_inputs,
