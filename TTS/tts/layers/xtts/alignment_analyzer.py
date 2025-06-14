@@ -54,9 +54,13 @@ import math
 from collections import deque
 from collections.abc import Callable
 from types import FunctionType, MethodType
+from typing import Any
 
 import torch
 from torch.utils.hooks import RemovableHandle
+
+ExtractAttention = Callable[[torch.nn.Module, tuple[Any, ...], tuple[Any, ...]], torch.Tensor]
+PatchedForward = Callable[[Callable[..., Any], Any], Any]
 
 
 class AlignmentAnalyzer:
@@ -84,23 +88,29 @@ class AlignmentAnalyzer:
     def __init__(
         self,
         attention_layer: torch.nn.Module,
-        extract_attention: Callable[[torch.nn.Module, tuple, tuple], torch.Tensor],
+        extract_attention: ExtractAttention,
         *,
-        patched_forward: Callable | None = None,
+        patched_forward: PatchedForward | None = None,
         verbose: bool = False,
     ) -> None:
         """
         Parameters
         ----------
         attention_layer
-            Decoder self-attention layer to observe.
+            The decoder self-attention module to observe.
         extract_attention
-            Callback returning (B, heads, N, N) attention given
-            (module, inputs, output).
-        force_output_attention
-            Patch the target layer so it always emits its attention map.
+            Hook callback that extracts the raw attention tensor
+            ``(B, heads, N, N)`` from the layer’s forward signature.
+        patched_forward
+            Optional wrapper invoked as::
+
+                patched_forward(original_forward, *args, **kwargs)
+
+            Use it when you need to tweak the layer call
+            (e.g. add ``output_attentions=True``) before the original
+            forward executes.  Pass ``None`` to leave the layer unpatched.
         verbose
-            If `True`, print frame-by-frame debug traces to the console.
+            When ``True`` print per-frame debug traces.
         """
         self._layer = attention_layer
         self._extract_attention = extract_attention
