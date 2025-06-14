@@ -86,7 +86,7 @@ class AlignmentAnalyzer:
         attention_layer: torch.nn.Module,
         extract_attention: Callable[[torch.nn.Module, tuple, tuple], torch.Tensor],
         *,
-        force_output_attention: bool = True,
+        patched_forward: Callable | None = None,
         verbose: bool = False,
     ) -> None:
         """
@@ -104,13 +104,13 @@ class AlignmentAnalyzer:
         """
         self._layer = attention_layer
         self._extract_attention = extract_attention
-        self._force_output_attention = force_output_attention
+        self._patched_forward = patched_forward
         self._verbose = verbose
 
         # runtime state filled by `initialize`
-        self._hook: Optional[RemovableHandle] = None
-        self._orig_forward: Optional[FunctionType] = None
-        self._last_attention: Optional[torch.Tensor] = None
+        self._hook: RemovableHandle | None = None
+        self._orig_forward: FunctionType | None = None
+        self._last_attention: torch.Tensor | None = None
         self._ready = False
 
     # ─────────────────────── Public API ──────────────────────────
@@ -278,19 +278,19 @@ class AlignmentAnalyzer:
 
         self._hook = self._layer.register_forward_hook(_hook)
 
-        if self._force_output_attention:
+        if self._patched_forward:
+            print("before hooking : ", self._layer.forward)
             self._orig_forward = self._layer.forward
-
-            def _forward(_, *a, **kw):
-                kw["output_attentions"] = True
-                return self._orig_forward(*a, **kw)
-
+            _forward = lambda _, *a, **kw: self._patched_forward(self._orig_forward, *a, **kw)
             self._layer.forward = MethodType(_forward, self._layer)
+            print("after hooking : ", self._layer.forward)
 
     def _detach_hook(self) -> None:
         if self._hook:
             self._hook.remove()
             self._hook = None
         if self._orig_forward:
+            print("before unhooking : ", self._layer.forward)
             self._layer.forward = MethodType(self._orig_forward, self._layer)
             self._orig_forward = None
+            print("after unhooking : ", self._layer.forward)
