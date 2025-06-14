@@ -154,7 +154,7 @@ class GPT(nn.Module):
         self.gpt.wte = self.mel_embedding
 
         # NOTE: set to true for test purposes only
-        use_deepspeed = False
+        use_deepspeed = True
         if use_deepspeed:
             import deepspeed
             from transformers.models.gpt2.modeling_gpt2 import GPT2Attention

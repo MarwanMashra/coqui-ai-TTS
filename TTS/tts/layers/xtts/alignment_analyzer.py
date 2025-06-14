@@ -49,11 +49,11 @@ constants and can be tuned empirically.
 
 from __future__ import annotations
 
+import inspect
 import math
 from collections import deque
 from collections.abc import Callable
 from types import FunctionType, MethodType
-from typing import Optional
 
 import torch
 from torch.utils.hooks import RemovableHandle
@@ -109,7 +109,7 @@ class AlignmentAnalyzer:
 
         # runtime state filled by `initialize`
         self._hook: RemovableHandle | None = None
-        self._orig_forward: FunctionType | None = None
+        self._orig_forward_func: FunctionType | None = None
         self._last_attention: torch.Tensor | None = None
         self._ready = False
 
@@ -273,24 +273,40 @@ class AlignmentAnalyzer:
 
     # Hook plumbing ----------------------------------------------------------
     def _attach_hook(self) -> None:
-        def _hook(_, inputs, output):
-            self._last_attention = self._extract_attention(_, inputs, output)[0].mean(0).cpu()
+        """Grab attention and (optionally) patch the layer's .forward."""
+
+        # 1. Forward-hook to store the latest attention
+        def _hook(module, inputs, output):
+            att = self._extract_attention(module, inputs, output)[0]  # (B,H,N,N)
+            self._last_attention = att.mean(0).cpu()  # (N,N)
 
         self._hook = self._layer.register_forward_hook(_hook)
 
-        if self._patched_forward:
-            print("before hooking : ", self._layer.forward)
-            self._orig_forward = self._layer.forward
-            _forward = lambda _, *a, **kw: self._patched_forward(self._orig_forward, *a, **kw)
-            self._layer.forward = MethodType(_forward, self._layer)
-            print("after hooking : ", self._layer.forward)
+        # 2. Patch the forward pass
+        if self._patched_forward is None:
+            return
+
+        self._orig_forward_func = self._layer.forward.__func__
+        param_names = list(inspect.signature(self._orig_forward_func).parameters)[1:]
+
+        def _forward(module_self, *args, **kwargs):
+            """
+            Bound shim that:
+            • drops keyword duplicates already given positionally
+            • wraps the original forward with user-provided patched_forward
+            """
+            for name in param_names[: len(args)]:
+                kwargs.pop(name, None)  # deletes layer_past / attention_mask duplicates
+
+            orig_bound = MethodType(self._orig_forward_func, module_self)
+            return self._patched_forward(orig_bound, *args, **kwargs)
+
+        self._layer.forward = MethodType(_forward, self._layer)
 
     def _detach_hook(self) -> None:
         if self._hook:
             self._hook.remove()
             self._hook = None
-        if self._orig_forward:
-            print("before unhooking : ", self._layer.forward)
-            self._layer.forward = MethodType(self._orig_forward, self._layer)
-            self._orig_forward = None
-            print("after unhooking : ", self._layer.forward)
+        if self._orig_forward_func:
+            self._layer.forward = MethodType(self._orig_forward_func, self._layer)
+            self._orig_forward_func = None
