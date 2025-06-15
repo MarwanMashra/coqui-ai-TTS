@@ -1,8 +1,6 @@
-import json
 from pathlib import Path
 
 import tqdm
-from deepspeed.model_implementations.transformers.ds_gpt import DeepSpeedGPTInference
 
 from TTS.api import TTS
 
@@ -13,12 +11,12 @@ def run(output_dir: Path):
         tts.tts_to_file(
             # text="Hello, my name is Marwan an I am a software engineer in a small city in France.",
             # text="مرحبا، اسمي مروان وأنا مهندس برمجيات منذ عام 2016 في مدينة صغيرة في فرنسا.",
-            # text="Greetings, ",
-            text="Huh, ",
+            text="Greetings, ",
+            # text="Huh, ",
             # text="VR",
             # speaker="Damien Black",
-            # speaker_wav="data/input/clovis.wav",
-            speaker_wav="data/input/chirac.wav",
+            speaker_wav="data/input/clovis.wav",
+            # speaker_wav="data/input/chirac.wav",
             # speaker_wav="data/input/trex.wav",
             language="en",
             file_path=str(output_dir / f"output_{i}.wav"),

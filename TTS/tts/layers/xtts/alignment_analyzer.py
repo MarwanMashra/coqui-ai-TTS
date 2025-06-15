@@ -2,49 +2,23 @@
 alignment_analyzer.py
 =====================
 
-**Purpose**
+Detect when a streaming TTS decoder drifts into tail-hallucination and
+force an early **EOS** token.
 
-Detect when a streaming text-to-speech decoder has lost alignment with the
-prompt text and force an early **EOS** token to suppress tail-hallucinations
-and silence.
+Two independent guards are used:
 
-The heuristic fuses three independent signals:
+1. **“Stuck-at-start” loop**
+   Many bad runs bounce on prompt token 1 (usually a comma) forever.
+   If that has happened in ≥ `START_STUCK_RATIO_CUTOFF` of the last
+   `START_STUCK_WINDOW_FRAMES` frames, we cut.
 
-1. **Visited-edge stall**
-   *We expect forward momentum.*
-   A running “edge” marks the highest prompt token that has been confirmed
-   by attention.  If the arg-max attention index (`arg_max`) sits more than
-   `EDGE_BACK_TOLERANCE` tokens **behind** that edge in a high percentage of
-   the last `STALE_WINDOW_FRAMES` frames, generation is declared *stagnant*.
+2. **EOS hold**
+   Once we have confidently “visited” the final prompt token, we grant
+   `EOS_HOLD_FRAMES` more frames (to let trailing silence finish).
+   After that we cut.
 
-2. **“Stuck-at-start” loop**
-   Many pathological runs bounce on **prompt token 1** (typically the comma
-   after a greeting) and never recover.  If `arg_max` has been exactly
-   `START_STUCK_IDX` (hard-wired = 1) in ≥ `START_STUCK_RATIO_CUTOFF`
-   of the last `START_STUCK_WINDOW_FRAMES` frames, we cut.
-
-3. **EOS hold**
-   Once the visited edge reaches the final prompt token, we allow the model
-   `EOS_HOLD_FRAMES` more frames to output trailing silence; after that we cut.
-
-**How the visited edge advances**
-
-* Let `cursor` be a smoothed version of `arg_max` that only updates when
-  `arg_max` lies inside an acceptance window
-  `[cursor − CURSOR_WINDOW_LEFT , cursor + CURSOR_WINDOW_RIGHT]`.
-* Every frame each **unvisited** token *between the current edge and
-  `min(cursor, arg_max)`* accrues a hit.
-* A token `t` becomes *visited* once its consecutive hit count ≥
-
-      VISIT_BASE_FRAMES + ceil((t − edge − 1) × VISIT_JUMP_SCALE).
-
-  Longer jumps thus require proportionally longer confirmation.
-* When several contiguous tokens satisfy the rule simultaneously, the edge
-  can advance by more than one token in a single frame.
-
-Set `verbose=True` in the constructor and enable the module logger at
-DEBUG level to see frame-by-frame traces.  All thresholds are module-level
-constants and can be tuned empirically.
+The code keeps the visited-edge machinery for EOS-hold timing, but the
+old “edge-back stagnant” check has been removed.
 """
 
 from __future__ import annotations
@@ -71,12 +45,6 @@ class AlignmentAnalyzer:
     VISIT_BASE_FRAMES = 3
     VISIT_JUMP_SCALE = 0.5
 
-    EDGE_BACK_TOLERANCE = 0
-
-    STALE_WINDOW_FRAMES = 15
-    STALE_RATIO_CUTOFF = 0.80
-    STALE_MIN_FILL = STALE_WINDOW_FRAMES // 2
-
     EOS_HOLD_FRAMES = 4
 
     # “stuck at the very beginning” guard (token index 1 is hard-wired)
@@ -93,25 +61,6 @@ class AlignmentAnalyzer:
         patched_forward: PatchedForward | None = None,
         verbose: bool = False,
     ) -> None:
-        """
-        Parameters
-        ----------
-        attention_layer
-            The decoder self-attention module to observe.
-        extract_attention
-            Hook callback that extracts the raw attention tensor
-            ``(B, heads, N, N)`` from the layer’s forward signature.
-        patched_forward
-            Optional wrapper invoked as::
-
-                patched_forward(original_forward, *args, **kwargs)
-
-            Use it when you need to tweak the layer call
-            (e.g. add ``output_attentions=True``) before the original
-            forward executes.  Pass ``None`` to leave the layer unpatched.
-        verbose
-            When ``True`` print per-frame debug traces.
-        """
         self._layer = attention_layer
         self._extract_attention = extract_attention
         self._patched_forward = patched_forward
@@ -126,16 +75,6 @@ class AlignmentAnalyzer:
     # ─────────────────────── Public API ──────────────────────────
 
     def initialize(self, text_span: tuple[int, int], eos_token_id: int) -> None:
-        """
-        Initialize internal state to get ready for a new generation pass.
-
-        Parameters
-        ----------
-        text_span
-            (start, end) slice of prompt tokens inside model sequence.
-        eos_token_id
-            Vocabulary id for EOS token.
-        """
         start, end = text_span
         self._text_len = end - start
         self._span = text_span
@@ -150,7 +89,6 @@ class AlignmentAnalyzer:
         self._visited = [False] * self._text_len
         self._edge = -1
 
-        self._stale_hist: deque[bool] = deque(maxlen=self.STALE_WINDOW_FRAMES)
         self._stuck_hist: deque[bool] = deque(maxlen=self.START_STUCK_WINDOW_FRAMES)
         self._eos_hold = 0
 
@@ -173,7 +111,6 @@ class AlignmentAnalyzer:
         self._update_cursor(arg_max)
         self._update_streaks(arg_max)
         self._advance_edge()
-        self._update_stale(arg_max)
         self._update_stuck(arg_max)
         self._update_eos_hold()
 
@@ -182,16 +119,18 @@ class AlignmentAnalyzer:
             logits[..., self._eos_id] = 2**15
             if self._verbose:
                 print(
-                    f"AlignmentAnalyzer: force EOS | edge={self._edge} stale={self._stale_ratio:.2f} "
+                    f"AlignmentAnalyzer: force EOS | edge={self._edge} "
                     f"stuck={self._stuck_ratio:.2f} eos={self._eos_hold}"
                 )
 
         if self._verbose:
             print(
-                f"AlignmentAnalyzer: F{self._frame:04d} | arg={arg_max:3d} cur={self._cursor:3d} edge={self._edge:3d} "
-                f"dist={self._cursor - self._edge:2d} stale={self._stale_hist[-1] if self._stale_hist else False}({self._stale_ratio:.2f}) "
-                f"stuck={self._stuck_hist[-1] if self._stuck_hist else False}({self._stuck_ratio:.2f}) "
-                f"eos={self._eos_hold} cut={self._should_cut()}"
+                f"AlignmentAnalyzer: F{self._frame:04d} | arg={arg_max:3d} "
+                f"cur={self._cursor:3d} edge={self._edge:3d} "
+                f"dist={self._cursor - self._edge:2d} "
+                f"stuck={self._stuck_hist[-1] if self._stuck_hist else False}"
+                f"({self._stuck_ratio:.2f}) eos={self._eos_hold} "
+                f"cut={self._should_cut()}"
             )
 
         self._frame += 1
@@ -211,14 +150,6 @@ class AlignmentAnalyzer:
 
     # Cursor smoothing ------------------------------------------------------
     def _update_cursor(self, arg_max: int) -> None:
-        """
-        Move the smoothing cursor.
-
-        * Follow the arg-max if it lies within the acceptance window
-        [cursor−L , cursor+R] (usual case).
-        * If the arg-max lies **outside** that range, re-center the cursor
-        immediately.  This prevents the “stuck-since-frame-0” bug.
-        """
         if arg_max < self._cursor - self.CURSOR_WINDOW_LEFT or arg_max > self._cursor + self.CURSOR_WINDOW_RIGHT:
             self._cursor = arg_max
         elif (
@@ -253,12 +184,6 @@ class AlignmentAnalyzer:
         while self._edge + 1 < self._text_len and self._visited[self._edge + 1]:
             self._edge += 1
 
-    # Staleness detection ----------------------------------------------------
-    def _update_stale(self, arg_max: int) -> None:
-        stale = arg_max < self._edge - self.EDGE_BACK_TOLERANCE
-        self._stale_hist.append(stale)
-        self._stale_ratio = sum(self._stale_hist) / len(self._stale_hist)
-
     # “Stuck at start” detection --------------------------------------------
     def _update_stuck(self, arg_max: int) -> None:
         self._stuck_hist.append(arg_max == self.START_STUCK_IDX)
@@ -271,15 +196,12 @@ class AlignmentAnalyzer:
 
     # Final cut decision -----------------------------------------------------
     def _should_cut(self) -> bool:
-        # NOTE: stagnant condition is dangerous, maybe remove it?
-        # stagnant = len(self._stale_hist) >= self.STALE_MIN_FILL and self._stale_ratio >= self.STALE_RATIO_CUTOFF
-        stagnant = False
         stuck_loop = (
             len(self._stuck_hist) == self.START_STUCK_WINDOW_FRAMES
             and self._stuck_ratio >= self.START_STUCK_RATIO_CUTOFF
         )
         eos_done = self._eos_hold >= self.EOS_HOLD_FRAMES
-        return stagnant or stuck_loop or eos_done
+        return stuck_loop or eos_done
 
     # Hook plumbing ----------------------------------------------------------
     def _attach_hook(self) -> None:
@@ -292,7 +214,7 @@ class AlignmentAnalyzer:
 
         self._hook = self._layer.register_forward_hook(_hook)
 
-        # 2. Patch the forward pass
+        # 2. Patch the forward pass if requested
         if self._patched_forward is None:
             return
 
@@ -300,14 +222,8 @@ class AlignmentAnalyzer:
         param_names = list(inspect.signature(self._orig_forward_func).parameters)[1:]
 
         def _forward(module_self, *args, **kwargs):
-            """
-            Bound shim that:
-            • drops keyword duplicates already given positionally
-            • wraps the original forward with user-provided patched_forward
-            """
             for name in param_names[: len(args)]:
-                kwargs.pop(name, None)  # deletes layer_past / attention_mask duplicates
-
+                kwargs.pop(name, None)  # drop duplicate kw-args
             orig_bound = MethodType(self._orig_forward_func, module_self)
             return self._patched_forward(orig_bound, *args, **kwargs)
 
