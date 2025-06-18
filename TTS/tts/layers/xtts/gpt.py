@@ -154,7 +154,6 @@ class GPT(nn.Module):
         self.gpt.wte = self.mel_embedding
 
         # NOTE: set to true for test purposes only
-        use_deepspeed = True
         if use_deepspeed:
             import deepspeed
             from transformers.models.gpt2.modeling_gpt2 import GPT2Attention
@@ -186,7 +185,7 @@ class GPT(nn.Module):
             self.alignment_analyzer = AlignmentAnalyzer(
                 self.gpt_inference.transformer.h[self.alignment_layer_idx].attention,
                 extract_attention=recompute_attn_with_gpt2_layer,
-                verbose=True,  # for debugging purposes
+                # verbose=True,  # for debugging purposes
             )
         else:
 
@@ -198,7 +197,7 @@ class GPT(nn.Module):
                 self.gpt_inference.transformer.h[self.alignment_layer_idx].attn,
                 extract_attention=lambda module, inputs, outputs: outputs[2],
                 patched_forward=patched_forward,
-                verbose=True,  # for debugging purposes
+                # verbose=True,  # for debugging purposes
             )
 
         self.gpt_inference.set_alignment_analyzer(self.alignment_analyzer)
