@@ -185,7 +185,7 @@ class GPT(nn.Module):
             self.alignment_analyzer = AlignmentAnalyzer(
                 self.gpt_inference.transformer.h[self.alignment_layer_idx].attention,
                 extract_attention=recompute_attn_with_gpt2_layer,
-                # verbose=True,  # for debugging purposes
+                verbose=True,  # for debugging purposes
             )
         else:
 
@@ -197,7 +197,7 @@ class GPT(nn.Module):
                 self.gpt_inference.transformer.h[self.alignment_layer_idx].attn,
                 extract_attention=lambda module, inputs, outputs: outputs[2],
                 patched_forward=patched_forward,
-                # verbose=True,  # for debugging purposes
+                verbose=True,  # for debugging purposes
             )
 
         self.gpt_inference.set_alignment_analyzer(self.alignment_analyzer)
@@ -569,7 +569,8 @@ class GPT(nn.Module):
             attention_mask=attention_mask,
             **hf_generate_kwargs,
         )
-        self.alignment_analyzer.reset()
+        # TODO: return a boolean mask to filter out the hallucinated tokens
+        hallu_mask = self.alignment_analyzer.reset()
         if "return_dict_in_generate" in hf_generate_kwargs:
             return gen.sequences[:, gpt_inputs.shape[1] :], gen
         return gen[:, gpt_inputs.shape[1] :]

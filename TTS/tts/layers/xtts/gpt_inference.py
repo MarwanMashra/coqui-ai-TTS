@@ -123,8 +123,6 @@ class GPT2InferenceModel(GPT2PreTrainedModel, GenerationMixin):
         lm_logits = self.lm_head(hidden_states)
         lm_logits = self.alignment_analyzer.step(lm_logits)
 
-        # NOTE: alignment step should be called here
-
         if not return_dict:
             return (lm_logits,) + transformer_outputs[1:]
 
