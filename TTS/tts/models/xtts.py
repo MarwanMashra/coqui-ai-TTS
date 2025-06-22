@@ -163,7 +163,7 @@ class XttsArgs(Coqpit):
     gpt_code_stride_len: int = 1024
     gpt_use_masking_gt_prompt_approach: bool = True
     gpt_use_perceiver_resampler: bool = False
-    gpt_alignment_layer_idx: int = 12  # hparam, the layer that has the alignment information
+    gpt_alignment_layer_idx: int | None = None
 
     # HifiGAN Decoder params
     input_sample_rate: int = 22050

@@ -41,7 +41,7 @@ class GPT(nn.Module):
         label_smoothing=0.0,
         use_perceiver_resampler=False,
         perceiver_cond_length_compression=256,
-        alignment_layer_idx=12,
+        alignment_layer_idx=None,
     ):
         """
         Args:
@@ -73,6 +73,7 @@ class GPT(nn.Module):
         self.use_perceiver_resampler = use_perceiver_resampler
         self.perceiver_cond_length_compression = perceiver_cond_length_compression
         self.alignment_layer_idx = alignment_layer_idx
+        self.alignment_analyzer: AlignmentAnalyzer | None = None
 
         self.text_embedding = nn.Embedding(self.number_text_tokens, model_dim)
         self.mel_embedding = nn.Embedding(self.num_audio_tokens, model_dim)
@@ -153,6 +154,8 @@ class GPT(nn.Module):
         )
         self.gpt.wte = self.mel_embedding
 
+        init_alignment_analyzer = self.alignment_layer_idx is not None
+
         # NOTE: set to true for test purposes only
         if use_deepspeed:
             import deepspeed
@@ -161,7 +164,8 @@ class GPT(nn.Module):
             # Deepspeed attention layers don't allow us to get back attn weights even when output_attentions=True
             # therefore, we have to either recompute attn weights ourselves, or use the original GPT2Attention layer
             # store the original GPT2Attention layer before it get replaced by deepspeed attention layer
-            gpt2_attn_layer: GPT2Attention = self.gpt.h[self.alignment_layer_idx].attn.to("cuda")
+            if init_alignment_analyzer:
+                gpt2_attn_layer: GPT2Attention = self.gpt.h[self.alignment_layer_idx].attn.to("cuda")
 
             self.ds_engine = deepspeed.init_inference(
                 model=self.gpt_inference.half(),  # Transformers models
@@ -171,23 +175,24 @@ class GPT(nn.Module):
                 replace_with_kernel_inject=True,  # replace the model with the kernel injector
             )
             self.gpt_inference = self.ds_engine.module.eval()
+            if init_alignment_analyzer:
 
-            def recompute_attn_with_gpt2_layer(module, inputs, outputs):
-                _, input_mask, head_mask, layer_past, *_ = inputs
-                return gpt2_attn_layer.forward(
-                    hidden_states=outputs[-1],  # outputs=(output, key_layer, value_layer, context_layer, inp_norm)
-                    layer_past=layer_past,
-                    attention_mask=input_mask,
-                    head_mask=head_mask,
-                    output_attentions=True,
-                )[2]
+                def recompute_attn_with_gpt2_layer(module, inputs, outputs):
+                    _, input_mask, head_mask, layer_past, *_ = inputs
+                    return gpt2_attn_layer.forward(
+                        hidden_states=outputs[-1],  # outputs=(output, key_layer, value_layer, context_layer, inp_norm)
+                        layer_past=layer_past,
+                        attention_mask=input_mask,
+                        head_mask=head_mask,
+                        output_attentions=True,
+                    )[2]
 
-            self.alignment_analyzer = AlignmentAnalyzer(
-                self.gpt_inference.transformer.h[self.alignment_layer_idx].attention,
-                extract_attention=recompute_attn_with_gpt2_layer,
-                verbose=True,  # for debugging purposes
-            )
-        else:
+                self.alignment_analyzer = AlignmentAnalyzer(
+                    self.gpt_inference.transformer.h[self.alignment_layer_idx].attention,
+                    extract_attention=recompute_attn_with_gpt2_layer,
+                    verbose=True,  # for debugging purposes
+                )
+        elif init_alignment_analyzer:
 
             def patched_forward(original_forward, *args, **kwargs):
                 kwargs["output_attentions"] = True
@@ -200,7 +205,8 @@ class GPT(nn.Module):
                 verbose=True,  # for debugging purposes
             )
 
-        self.gpt_inference.set_alignment_analyzer(self.alignment_analyzer)
+        if init_alignment_analyzer:
+            self.gpt_inference.set_alignment_analyzer(self.alignment_analyzer)
 
     def set_inputs_and_targets(self, input, start_token, stop_token):
         inp = F.pad(input, (1, 0), value=start_token)
@@ -556,10 +562,11 @@ class GPT(nn.Module):
         gpt_inputs = self.compute_embeddings(cond_latents, text_inputs)
         stop_token_tensor = torch.tensor(self.stop_audio_token, device=gpt_inputs.device, dtype=torch.long)
         attention_mask = _prepare_attention_mask_for_generation(gpt_inputs, stop_token_tensor, stop_token_tensor)
-        self.alignment_analyzer.initialize(
-            text_span=(cond_latents.size(1) + 1, cond_latents.size(1) + 1 + text_inputs.size(1)),
-            eos_token_id=self.stop_audio_token,
-        )
+        if self.alignment_analyzer:
+            self.alignment_analyzer.initialize(
+                text_span=(cond_latents.size(1) + 1, cond_latents.size(1) + 1 + text_inputs.size(1)),
+                eos_token_id=self.stop_audio_token,
+            )
         gen = self.gpt_inference.generate(
             gpt_inputs,
             bos_token_id=self.start_audio_token,
@@ -569,8 +576,9 @@ class GPT(nn.Module):
             attention_mask=attention_mask,
             **hf_generate_kwargs,
         )
-        # TODO: return a boolean mask to filter out the hallucinated tokens
-        hallu_mask = self.alignment_analyzer.reset()
+        if self.alignment_analyzer:
+            # TODO: return a boolean mask to filter out the hallucinated tokens
+            hallu_mask = self.alignment_analyzer.reset()
         if "return_dict_in_generate" in hf_generate_kwargs:
             return gen.sequences[:, gpt_inputs.shape[1] :], gen
         return gen[:, gpt_inputs.shape[1] :]

@@ -10,9 +10,6 @@ from TTS.tts.layers.xtts.stream_generator import StreamGenerationConfig
 class GPT2InferenceModel(GPT2PreTrainedModel, GenerationMixin):
     """Override GPT2LMHeadModel to allow for prefix conditioning."""
 
-    alignment_analyzer: AlignmentAnalyzer
-    alignment_layer_idx: int = 12  # hparam, the layer that has the alignment information
-
     def __init__(self, config, gpt: GPT2Model, pos_emb, embeddings, norm, linear, kv_cache):
         super().__init__(config)
         self.transformer = gpt
@@ -22,6 +19,7 @@ class GPT2InferenceModel(GPT2PreTrainedModel, GenerationMixin):
         self.lm_head = nn.Sequential(norm, linear)
         self.kv_cache = kv_cache
         self.generation_config = StreamGenerationConfig.from_model_config(config) if self.can_generate() else None
+        self.alignment_analyzer: AlignmentAnalyzer | None = None
 
     def set_alignment_analyzer(self, alignment_analyzer: AlignmentAnalyzer):
         """Set the alignment analyzer for this model."""
@@ -121,7 +119,8 @@ class GPT2InferenceModel(GPT2PreTrainedModel, GenerationMixin):
         )
         hidden_states = transformer_outputs[0]
         lm_logits = self.lm_head(hidden_states)
-        lm_logits = self.alignment_analyzer.step(lm_logits)
+        if self.alignment_analyzer:
+            lm_logits = self.alignment_analyzer.step(lm_logits)
 
         if not return_dict:
             return (lm_logits,) + transformer_outputs[1:]
