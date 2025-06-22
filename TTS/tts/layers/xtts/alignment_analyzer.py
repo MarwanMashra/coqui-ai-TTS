@@ -55,8 +55,7 @@ class AlignmentAnalyzer:
     EOS_HOLD_FRAMES: int = 5
 
     # Hallucination‑loop guard (token index 1 is hard‑wired)
-    HALLU_IDX: int = 1
-    WINDOW_FRAMES: int = 10
+    WINDOW_FRAMES: int = 15
     LOOP_RATIO_CUTOFF: float = 0.70
 
     # logit clipping value (large negative)
@@ -128,8 +127,8 @@ class AlignmentAnalyzer:
 
     def reset(self) -> None:
         """Detach the hook and clear state (call after each utterance)."""
-        self._detach_hook()
         self._ready = False
+        self._detach_hook()
 
     @torch.no_grad()
     def step(self, logits: torch.Tensor) -> torch.Tensor:
@@ -156,7 +155,7 @@ class AlignmentAnalyzer:
             ratio_disp = f"{self._loop_ratio:.2f}" if math.isfinite(self._loop_ratio) else "n/a"
             print(
                 f"F{self._frame:04d} | arg={arg_max:3d} ub={self._upper_bound:3d} "
-                f"edge={self._edge:3d}/{self._text_len} dist={self._upper_bound - self._edge:2d} "
+                f"edge={self._edge:3d}/{self._text_len - 1} dist={self._upper_bound - self._edge:2d} "
                 f"hit={last_hit} ratio={ratio_disp} hold={self._eos_hold} cut={self._should_cut()}"
             )
 
@@ -169,7 +168,6 @@ class AlignmentAnalyzer:
         attn = self._last_attention  # (heads, seq, seq)
         row = attn[end:, start:end] if self._frame == 0 else attn[:, start:end]
         row = row.clone().cpu()
-        row[:, 0] = 0  # mask BOS
         self._alignment = torch.cat((self._alignment, row), 0)
         return int(row[-1].argmax())
 
@@ -202,7 +200,7 @@ class AlignmentAnalyzer:
 
     def _update_loop_ratio(self, arg_max: int) -> None:
         """Maintain sliding window of hits and compute *loop_ratio*."""
-        self._loop_window.append(arg_max == self.HALLU_IDX)
+        self._loop_window.append(arg_max == 0 or arg_max == self._text_len - 1)
         if len(self._loop_window) == self.WINDOW_FRAMES:
             self._loop_ratio = sum(self._loop_window) / self.WINDOW_FRAMES
         else:

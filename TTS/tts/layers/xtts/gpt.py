@@ -487,7 +487,6 @@ class GPT(nn.Module):
             attn_mask_mel=attn_mask_mel,
         )
 
-        # self.gpt_inference.alignment_analyzer.step(mel_logits)
         if return_latent:
             return mel_logits[:, :sub]  # sub to prevent bla.
 
@@ -558,7 +557,7 @@ class GPT(nn.Module):
         stop_token_tensor = torch.tensor(self.stop_audio_token, device=gpt_inputs.device, dtype=torch.long)
         attention_mask = _prepare_attention_mask_for_generation(gpt_inputs, stop_token_tensor, stop_token_tensor)
         self.alignment_analyzer.initialize(
-            text_span=(cond_latents.size(1), cond_latents.size(1) + text_inputs.size(1) + 2),
+            text_span=(cond_latents.size(1) + 1, cond_latents.size(1) + 1 + text_inputs.size(1)),
             eos_token_id=self.stop_audio_token,
         )
         gen = self.gpt_inference.generate(
