@@ -465,6 +465,12 @@ class GPT(nn.Module):
 
         # Get logits
         sub = -5  # don't ask me why 😄
+        # The above is probably because of adding 3 to code_lengths above, as well as the start and stop tokens.
+        # Therefore mel_logits = emb([ start_audio_token, audio_codes, 0, 0, 0, stop_audio_token])
+        # we probably should be doing mel_logits[:, 1:-4] instead (or just mel_logits[:, 1:-1] and don't do +3 to code_lengths)
+        # we are cutting one extra token at the end currenlty, I've seen cases of audio not containing the last sound
+        # I suspect this is due to this part of the code, still not sure why -1 in the case of training tho
+
         if self.training:
             sub = -1
 
