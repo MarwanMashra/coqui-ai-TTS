@@ -19,8 +19,6 @@ from TTS.tts.layers.xtts.perceiver_encoder import PerceiverResampler
 
 
 class GPT(nn.Module):
-    alignment_layer_idx: int = 12  # hparam, the layer that has the alignment information
-
     def __init__(
         self,
         start_text_token=261,
@@ -43,6 +41,7 @@ class GPT(nn.Module):
         label_smoothing=0.0,
         use_perceiver_resampler=False,
         perceiver_cond_length_compression=256,
+        alignment_layer_idx=12,
     ):
         """
         Args:
@@ -73,6 +72,7 @@ class GPT(nn.Module):
         self.average_conditioning_embeddings = average_conditioning_embeddings
         self.use_perceiver_resampler = use_perceiver_resampler
         self.perceiver_cond_length_compression = perceiver_cond_length_compression
+        self.alignment_layer_idx = alignment_layer_idx
 
         self.text_embedding = nn.Embedding(self.number_text_tokens, model_dim)
         self.mel_embedding = nn.Embedding(self.num_audio_tokens, model_dim)

@@ -163,6 +163,7 @@ class XttsArgs(Coqpit):
     gpt_code_stride_len: int = 1024
     gpt_use_masking_gt_prompt_approach: bool = True
     gpt_use_perceiver_resampler: bool = False
+    gpt_alignment_layer_idx: int = 12  # hparam, the layer that has the alignment information
 
     # HifiGAN Decoder params
     input_sample_rate: int = 22050
@@ -226,6 +227,7 @@ class Xtts(BaseTTS):
                 stop_audio_token=self.args.gpt_stop_audio_token,
                 use_perceiver_resampler=self.args.gpt_use_perceiver_resampler,
                 code_stride_len=self.args.gpt_code_stride_len,
+                alignment_layer_idx=self.args.gpt_alignment_layer_idx,
             )
 
         self.hifigan_decoder = HifiDecoder(
